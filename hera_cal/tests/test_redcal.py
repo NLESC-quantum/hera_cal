@@ -13,12 +13,12 @@ from hera_sim.antpos import linear_array, hex_array
 from hera_sim.vis import sim_red_data
 from hera_sim.sigchain import gen_gains
 
-from .. import redcal as om
-from .. import io, abscal
-from ..utils import split_pol, conj_pol, split_bl
-from ..apply_cal import calibrate_in_place
-from ..data import DATA_PATH
-from ..datacontainer import DataContainer
+from hera_cal import redcal as om
+from hera_cal import io, abscal
+from hera_cal.utils import split_pol, conj_pol, split_bl
+from hera_cal.apply_cal import calibrate_in_place
+from hera_cal.data import DATA_PATH
+from hera_cal.datacontainer import DataContainer
 
 np.random.seed(0)
 
@@ -118,6 +118,7 @@ class TestMethods(object):
         # reds = omni.filter_reds(self.info.get_reds(), ex_crosspols=()
 
     def test_filter_reds_2pol(self):
+
         antpos = linear_array(4)
         reds = om.get_reds(antpos, pols=['xx', 'yy'], pol_mode='1pol')
         # include pols
@@ -1721,3 +1722,6 @@ class TestRunMethods(object):
         assert a.ex_ants == [5, 6]
         assert a.gain == 0.4
         assert a.verbose is True
+
+if __name__ == "__main__":
+    sys.exit(pytest.main(["-qq"], plugins=[TestRedundantCalibrator()]))
