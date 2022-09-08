@@ -7,6 +7,7 @@ from copy import deepcopy
 import argparse
 import os
 import linsolve
+from qiskit import Aer
 
 from . import utils
 from .noise import predict_noise_variance_from_autos, infer_dt
@@ -719,6 +720,8 @@ class OmnicalSolver(linsolve.LinProductSolver):
                 print('    <CHISQ> = %f, <CONV> = %f, CNT = %d', (np.mean(chisq), np.mean(conv), update[0].size))
 
 
+
+
 class RedundantCalibrator:
 
     def __init__(self, reds, check_redundancy=False):
@@ -734,6 +737,11 @@ class RedundantCalibrator:
 
         self.reds = reds
         self.pol_mode = parse_pol_mode(self.reds)
+
+        self.quantum_backend = None
+        self.quantum_ansatz = None
+        self.quantum_optimizer = None
+    
 
         if check_redundancy:
             nDegens = self.count_degens(assume_redundant=False)
@@ -755,6 +763,30 @@ class RedundantCalibrator:
                 params = (ant_i, split_pol(pol)[0], ant_j, split_pol(pol)[1], ubl_index, blgrp[0][2])
                 eqs['g_%d_%s * g_%d_%s_ * u_%d_%s' % params] = (ant_i, ant_j, pol)
         return eqs
+
+    def set_quantum_backend(self, backend):
+        """Set the backend
+
+        Args:
+            backend (_type_): _description_
+        """
+        self.quantum_backend = backend
+
+    def set_quantum_ansatz(self, ansatz):
+        """_summary_
+
+        Args:
+            ansatz (_type_): _description_
+        """
+        self.quantum_ansatz = ansatz
+
+    def set_quantum_optimizer(self, opt):
+        """_summary_
+
+        Args:
+            opt (_type_): _description_
+        """
+        self.quantum_optimizer = opt
 
     def _solver(self, solver, data, wgts={}, detrend_phs=False, **kwargs):
         """Instantiates a linsolve solver for performing redcal.
@@ -819,7 +851,8 @@ class RedundantCalibrator:
 
     def _firstcal_iteration(self, data, df, f0, wgts={}, offsets_only=False, edge_cut=0,
                             sparse=False, mode='default', norm=True, medfilt=False, kernel=(1, 11),
-                            fc_min_vis_per_ant=None):
+                            fc_min_vis_per_ant=None, 
+                            ibmq_backend= Aer.get_backend('aer_simulator_statevector')):
         '''Runs a single iteration of firstcal, which uses phase differences between nominally
         redundant meausrements to solve for delays and phase offsets that produce gains of the
         form: np.exp(2j * np.pi * delay * freqs + 1j * offset).
@@ -883,7 +916,13 @@ class RedundantCalibrator:
             eq_key = '%s-%s-%s+%s' % (i, j, m, n)
             d_ls[eq_key] = np.array(tau_off_ij)
             w_ls[eq_key] = twgts[(bl1, bl2)]
+
         ls = linsolve.LinearSolver(d_ls, wgts=w_ls, sparse=sparse)
+        if mode in ls.quantum_solvers:
+            ls.set_quantum_backend(self.quantum_backend)
+            ls.set_quantum_ansatz(self.quantum_ansatz)
+            ls.set_quantum_optimizer(self.quantum_optimizer)
+
         sol = ls.solve(mode=mode)
         dly_sol = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
         off_sol = {self.unpack_sol_key(k): v[1] for k, v in sol.items()}
@@ -1193,7 +1232,6 @@ class RedundantCalibrator:
             return np.sum([A.shape[1] - np.linalg.matrix_rank(np.dot(np.squeeze(A).T, np.squeeze(A)))
                            for A in [solver.ls_amp.get_A(), solver.ls_phs.get_A()]])
 
-
 def is_redundantly_calibratable(antpos, bl_error_tol=1.0, require_coplanarity=True):
     """Figures out whether an array is redundantly calibratable.
 
@@ -1412,6 +1450,7 @@ def linear_cal_update(bls, cal, data, all_reds, weight_by_nsamples=False, weight
     d_ls = {eq: data[bl] for eq, bl in eqs.items()}
     w_ls = {eq: bl_wgts[bl] for eq, bl in eqs.items()}
     ls = linsolve.LinearSolver(d_ls, wgts=w_ls, **consts)
+
     sol = {rc_all.unpack_sol_key(k): val for k, val in ls.solve(mode='pinv').items()}
     for k in sol:  # flag data when it has zero or undefined weight
         sol[k][(total_wgts[k] == 0) | ~np.isfinite(total_wgts[k])] = np.nan
