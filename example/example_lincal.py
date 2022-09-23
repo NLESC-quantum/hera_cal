@@ -21,6 +21,27 @@ from qiskit.circuit.library.n_local.real_amplitudes import RealAmplitudes
 from qiskit.algorithms.optimizers import COBYLA
 from qiskit import Aer
 
+from qiskit_ibm_runtime import QiskitRuntimeService
+# from qiskit_research.vqls.runtime.runtime_wrapper import vqls_runner
+
+# ibmq_token = ''
+# hub = 'ibm-q-qal'
+# group = 'escience' # examnple 'escience'
+# project = 'qradio' # example qradio
+
+# QiskitRuntimeService.save_account(channel="ibm_quantum", 
+#                                   token=ibmq_token, 
+#                                   instance=hub+'/'+group+'/'+project,
+#                                   overwrite=True)
+
+# service = QiskitRuntimeService()
+
+# program_id = 'vqls-7WKEvMkw2V'
+
+# backend = service.backend("simulator_statevector")
+# job = vqls_runner(backend, A, b, program_id, ansatz, shots=25000)
+# res = job.result()
+
 NANTS = 4
 NFREQ = 64
 antpos = linear_array(NANTS)
@@ -42,6 +63,7 @@ info.set_quantum_backend(Aer.get_backend('aer_simulator_statevector'))
 num_qubits = int(np.ceil(np.log2(NANTS)))
 info.set_quantum_ansatz(RealAmplitudes(num_qubits, entanglement='full' , reps=3, insert_barriers=False))
 info.set_quantum_optimizer(COBYLA(maxiter=50, disp=True))
+
 
 
 dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
