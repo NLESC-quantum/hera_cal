@@ -5,6 +5,7 @@ import warnings
 import os
 import sys
 import shutil
+
 from hera_sim.antpos import linear_array, hex_array
 from hera_sim.vis import sim_red_data
 from hera_sim.sigchain import gen_gains
@@ -20,31 +21,18 @@ from hera_cal.datacontainer import DataContainer
 from qiskit.circuit.library.n_local.real_amplitudes import RealAmplitudes
 from qiskit.algorithms.optimizers import COBYLA
 from qiskit import Aer
-
+import matplotlib.pyplot as plt
 from qiskit_ibm_runtime import QiskitRuntimeService
-# from qiskit_research.vqls.runtime.runtime_wrapper import vqls_runner
 
-# ibmq_token = ''
-# hub = 'ibm-q-qal'
-# group = 'escience' # examnple 'escience'
-# project = 'qradio' # example qradio
-
-# QiskitRuntimeService.save_account(channel="ibm_quantum", 
-#                                   token=ibmq_token, 
-#                                   instance=hub+'/'+group+'/'+project,
-#                                   overwrite=True)
-
-# service = QiskitRuntimeService()
-
-# program_id = 'vqls-7WKEvMkw2V'
-
-# backend = service.backend("simulator_statevector")
-# job = vqls_runner(backend, A, b, program_id, ansatz, shots=25000)
-# res = job.result()
-
-NANTS = 4
-NFREQ = 64
+NANTS = 2**4
+NFREQ = 4
 antpos = linear_array(NANTS)
+
+
+for _,p in antpos.items():
+    plt.plot(p[0],p[1],'o',color='black')
+plt.show()
+
 reds = om.get_reds(antpos, pols=['xx'], pol_mode='1pol')
 info = om.RedundantCalibrator(reds)
 fqs = np.linspace(.1, .2, NFREQ)
@@ -64,11 +52,18 @@ num_qubits = int(np.ceil(np.log2(NANTS)))
 info.set_quantum_ansatz(RealAmplitudes(num_qubits, entanglement='full' , reps=3, insert_barriers=False))
 info.set_quantum_optimizer(COBYLA(maxiter=50, disp=True))
 
+info.set_ibmq_credential(ibmq_token="",
+                         hub="ibm-q-qal", 
+                         group="escience", 
+                         project="qradion")
 
+info.set_ibmq_runtime_program_options(program_id='vqls-7WKEvMkw2V', 
+                                      shots=2500)
 
 dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
                                             medfilt=False, 
                                             mode='vqls')
+                                            
 sol_degen = info.remove_degen_gains(dly_sol, degen_gains=delays, mode='phase')
 for i in range(NANTS):
     assert dly_sol[(i, 'Jxx')].dtype == np.float64

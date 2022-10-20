@@ -741,6 +741,8 @@ class RedundantCalibrator:
         self.quantum_backend = None
         self.quantum_ansatz = None
         self.quantum_optimizer = None
+        self.ibmq_credential = None
+        self.ibmq_runtime_program_options = None
     
 
         if check_redundancy:
@@ -787,6 +789,29 @@ class RedundantCalibrator:
             opt (_type_): _description_
         """
         self.quantum_optimizer = opt
+
+    def set_ibmq_credential(self, ibmq_token=None, hub=None, group=None, project=None):
+        """_summary_
+
+        Args:
+            ibmq_token (_type_, optional): _description_. Defaults to None.
+            hub (_type_, optional): _description_. Defaults to None.
+            group (_type_, optional): _description_. Defaults to None.
+            project (_type_, optional): _description_. Defaults to None.
+        """
+        self.ibmq_credential= {"ibmq_token":ibmq_token, 
+                               "hub":hub, 
+                               "group":group,
+                               "project":project}
+
+    def set_ibmq_runtime_program_options(self, program_id, **kwargs):
+        """_summary_
+
+        Args:
+            program_id (_type_): _description_
+        """
+        self.ibmq_runtime_program_options={"program_id":program_id}
+        self.ibmq_runtime_program_options.update(kwargs)
 
     def _solver(self, solver, data, wgts={}, detrend_phs=False, **kwargs):
         """Instantiates a linsolve solver for performing redcal.
@@ -916,12 +941,15 @@ class RedundantCalibrator:
             eq_key = '%s-%s-%s+%s' % (i, j, m, n)
             d_ls[eq_key] = np.array(tau_off_ij)
             w_ls[eq_key] = twgts[(bl1, bl2)]
-
+        # print(d_ls, w_ls)
         ls = linsolve.LinearSolver(d_ls, wgts=w_ls, sparse=sparse)
+
+
         if mode in ls.quantum_solvers:
             ls.set_quantum_backend(self.quantum_backend)
             ls.set_quantum_ansatz(self.quantum_ansatz)
             ls.set_quantum_optimizer(self.quantum_optimizer)
+            ls.set_ibmq_credential(self.ibmq_credential)
 
         sol = ls.solve(mode=mode)
         dly_sol = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
