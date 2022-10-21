@@ -55,7 +55,7 @@ info.set_quantum_optimizer(COBYLA(maxiter=50, disp=True))
 
 # info.set_quantum_circuits(circuits)
 
-info.set_ibmq_credential(ibmq_token="494a8792f270fe0072c01aa9fe2235dc645248bf699bf3473de20a36a31fcb6e4e5369614581bc30d27c3b1c888ef9204130908ecd05d80e5d6a82a7791d3430",
+info.set_ibmq_credential(ibmq_token="",
                          hub="ibm-q-qal", 
                          group="escience", 
                          project="qradio")
