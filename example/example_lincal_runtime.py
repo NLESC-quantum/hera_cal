@@ -18,17 +18,20 @@ from hera_cal.data import DATA_PATH
 from hera_cal.datacontainer import DataContainer
 from hera_cal.quantum_circuits import QuantumCircuitsLinearArray
 
-
+from qalcore.qiskit.vqls.numpy_unitary_matrices import UnitaryDecomposition 
 from qiskit.circuit.library.n_local.real_amplitudes import RealAmplitudes
 from qiskit.algorithms.optimizers import COBYLA
 from qiskit import Aer
 import matplotlib.pyplot as plt
 from qiskit_ibm_runtime import QiskitRuntimeService
 
-NANTS = 2**3
+NANTS = 2**2
 NFREQ = 5
 antpos = linear_array(NANTS)
-# circuits = QuantumCircuitsLinearArray(NANTS, NFREQ)
+circuits = QuantumCircuitsLinearArray(NANTS, NFREQ)
+
+# print(isinstance(circuits, UnitaryDecomposition))
+# exit()
 
 # for _,p in antpos.items():
 #     plt.plot(p[0],p[1],'o',color='black')
@@ -48,24 +51,25 @@ calibrate_in_place(d, gains, old_gains=g, gain_convention='multiply')
 d = {k: v.astype(np.complex64) for k, v in d.items()}
 
 
-info.set_quantum_backend(Aer.get_backend('aer_simulator_statevector'))
+# info.set_quantum_backend('simulator_statevector')
+info.set_quantum_backend('ibmq_belem')
 num_qubits = int(np.ceil(np.log2(NANTS)))
 info.set_quantum_ansatz(RealAmplitudes(num_qubits, entanglement='full' , reps=3, insert_barriers=False))
 info.set_quantum_optimizer(COBYLA(maxiter=50, disp=True))
 
-# info.set_quantum_circuits(circuits)
+info.set_quantum_circuits(circuits)
 
 info.set_ibmq_credential(ibmq_token="494a8792f270fe0072c01aa9fe2235dc645248bf699bf3473de20a36a31fcb6e4e5369614581bc30d27c3b1c888ef9204130908ecd05d80e5d6a82a7791d3430",
                          hub="ibm-q-qal", 
                          group="escience", 
                          project="qradio")
 
-# info.set_ibmq_runtime_program_options(program_id='vqls-Ejz5ewL0gW', 
-#                                       shots=2500)
+info.set_ibmq_runtime_program_options(program_id='vqls-6W8lAdQ3gW', 
+                                      shots=2500)
 
 dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
                                             medfilt=False, 
-                                            mode='vqls')
+                                            mode='vqls_runtime')
                                             
 sol_degen = info.remove_degen_gains(dly_sol, degen_gains=delays, mode='phase')
 for i in range(NANTS):

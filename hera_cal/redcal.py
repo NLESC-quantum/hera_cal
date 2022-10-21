@@ -743,6 +743,7 @@ class RedundantCalibrator:
         self.quantum_optimizer = None
         self.ibmq_credential = None
         self.ibmq_runtime_program_options = None
+        self.quantum_circuits = None
     
 
         if check_redundancy:
@@ -789,6 +790,14 @@ class RedundantCalibrator:
             opt (_type_): _description_
         """
         self.quantum_optimizer = opt
+
+    def set_quantum_circuits(self, circuits):
+        """_summary_
+
+        Args:
+            circuits (_type_): _description_
+        """
+        self.quantum_circuits = circuits
 
     def set_ibmq_credential(self, ibmq_token=None, hub=None, group=None, project=None):
         """_summary_
@@ -950,6 +959,8 @@ class RedundantCalibrator:
             ls.set_quantum_ansatz(self.quantum_ansatz)
             ls.set_quantum_optimizer(self.quantum_optimizer)
             ls.set_ibmq_credential(self.ibmq_credential)
+            ls.set_ibmq_runtime_program_options(self.ibmq_runtime_program_options)
+            ls.set_quantum_circuits(self.quantum_circuits)
 
         sol = ls.solve(mode=mode)
         dly_sol = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
