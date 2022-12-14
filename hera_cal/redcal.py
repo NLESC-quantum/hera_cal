@@ -885,8 +885,7 @@ class RedundantCalibrator:
 
     def _firstcal_iteration(self, data, df, f0, wgts={}, offsets_only=False, edge_cut=0,
                             sparse=False, mode='default', norm=True, medfilt=False, kernel=(1, 11),
-                            fc_min_vis_per_ant=None, 
-                            ibmq_backend= Aer.get_backend('aer_simulator_statevector')):
+                            fc_min_vis_per_ant=None, baseline_pairs=None):
         '''Runs a single iteration of firstcal, which uses phase differences between nominally
         redundant meausrements to solve for delays and phase offsets that produce gains of the
         form: np.exp(2j * np.pi * delay * freqs + 1j * offset).
@@ -962,7 +961,7 @@ class RedundantCalibrator:
             ls.set_ibmq_runtime_program_options(self.ibmq_runtime_program_options)
             ls.set_quantum_circuits(self.quantum_circuits)
 
-        sol = ls.solve(mode=mode)
+        sol = ls.solve(mode=mode, matrix_columns=baseline_pairs)
         dly_sol = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
         off_sol = {self.unpack_sol_key(k): v[1] for k, v in sol.items()}
         # add back in antennas in reds but not in the system of equations
@@ -1045,7 +1044,7 @@ class RedundantCalibrator:
         calibrate_in_place(data, g_fc, gain_convention='multiply')  # unapply calibration
         return meta, g_fc
 
-    def logcal(self, data, sol0={}, wgts={}, sparse=False, mode='default'):
+    def logcal(self, data, sol0={}, wgts={}, sparse=False, mode='default', baseline_pairs=None):
         """Takes the log to linearize redcal equations and minimizes chi^2.
 
         Args:
@@ -1068,7 +1067,7 @@ class RedundantCalibrator:
         fc_data = deepcopy(data)
         calibrate_in_place(fc_data, sol0)
         ls = self._solver(linsolve.LogProductSolver, fc_data, wgts=wgts, detrend_phs=True, sparse=sparse)
-        sol = ls.solve(mode=mode)
+        sol = ls.solve(mode=mode, baseline_pairs=baseline_pairs)
         sol = {self.unpack_sol_key(k): sol[k] for k in sol.keys()}
         for ubl_key in [k for k in sol.keys() if len(k) == 3]:
             sol[ubl_key] = sol[ubl_key] * self.phs_avg[ubl_key].conj()
