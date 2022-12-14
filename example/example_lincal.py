@@ -28,7 +28,8 @@ from qiskit_ibm_runtime import QiskitRuntimeService
 
 
 
-quantum = True
+vqls = False
+qubo = True
 
 NANTS = 8
 NFREQ = 64
@@ -69,7 +70,7 @@ for i in range(NANTS):
     assert dly_sol_ref[(i, 'Jxx')].shape == (1, 1)
     assert np.allclose(np.round(sol_degen_ref[(i, 'Jxx')] - delays[(i, 'Jxx')], 0), 0)
 
-if quantum:
+if vqls:
     
     info.set_quantum_backend(Aer.get_backend('aer_simulator_statevector'))
     num_qubits = int(np.ceil(np.log2(NANTS)))
@@ -86,28 +87,35 @@ if quantum:
     # info.set_ibmq_runtime_program_options(program_id='vqls-Ejz5ewL0gW', 
     #                                       shots=2500)
 
-
-
-
     dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
                                                 medfilt=False, 
                                                 mode='vqls',
                                                 baseline_pairs=baseline_pairs)
 
-    dly = [dly_sol[(i, 'Jxx')] for i in range(NANTS)]
-    dly_ref = np.array([dly_sol_ref[(i, 'Jxx')] for i in range(NANTS)])
-    dly_ref /= np.linalg.norm(dly_ref)
-    plt.scatter(dly_ref, dly)
-    plt.show()
 
-    sol_degen = info.remove_degen_gains(dly_sol, degen_gains=delays, mode='phase')
+elif qubo:
 
-    sol = [sol_degen[(i, 'Jxx')] for i in range(NANTS)]
-    ref = [delays[(i, 'Jxx')] for i in range(NANTS)]
-    plt.scatter(sol, ref)
-    plt.show()
+    dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
+                                                medfilt=False, 
+                                                mode='qubols')
 
-    for i in range(NANTS):
-        assert dly_sol[(i, 'Jxx')].dtype == np.float64
-        assert dly_sol[(i, 'Jxx')].shape == (1, 1)
-        assert np.allclose(np.round(sol_degen[(i, 'Jxx')] - delays[(i, 'Jxx')], 0), 0)
+dly = [dly_sol[(i, 'Jxx')] for i in range(NANTS)]
+dly_ref = np.array([dly_sol_ref[(i, 'Jxx')] for i in range(NANTS)])
+# dly_ref /= np.linalg.norm(dly_ref)
+print(dly)
+print(dly_ref)
+plt.scatter(dly_ref, dly)
+plt.show()
+
+sol_degen = info.remove_degen_gains(dly_sol, degen_gains=delays, mode='phase')
+
+sol = [sol_degen[(i, 'Jxx')] for i in range(NANTS)]
+ref = [delays[(i, 'Jxx')] for i in range(NANTS)]
+
+plt.scatter(sol, ref)
+plt.show()
+
+for i in range(NANTS):
+    assert dly_sol[(i, 'Jxx')].dtype == np.float64
+    assert dly_sol[(i, 'Jxx')].shape == (1, 1)
+    assert np.allclose(np.round(sol_degen[(i, 'Jxx')] - delays[(i, 'Jxx')], 0), 0)
