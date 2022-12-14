@@ -52,14 +52,14 @@ d = {k: v.astype(np.complex64) for k, v in d.items()}
 
 
 # info.set_quantum_backend('simulator_statevector')
-info.set_quantum_backend('ibmq_belem')
+info.set_quantum_backend('ibm_oslo')
 num_qubits = int(np.ceil(np.log2(NANTS)))
 info.set_quantum_ansatz(RealAmplitudes(num_qubits, entanglement='full' , reps=3, insert_barriers=False))
 info.set_quantum_optimizer(COBYLA(maxiter=50, disp=True))
 
 info.set_quantum_circuits(circuits)
 
-info.set_ibmq_credential(ibmq_token="",
+info.set_ibmq_credential(ibmq_token="494a8792f270fe0072c01aa9fe2235dc645248bf699bf3473de20a36a31fcb6e4e5369614581bc30d27c3b1c888ef9204130908ecd05d80e5d6a82a7791d3430",
                          hub="ibm-q-qal", 
                          group="escience", 
                          project="qradio")
