@@ -738,13 +738,15 @@ class RedundantCalibrator:
         self.reds = reds
         self.pol_mode = parse_pol_mode(self.reds)
 
-        self.quantum_backend = None
-        self.quantum_ansatz = None
-        self.quantum_optimizer = None
+        self.ibmq_backend = None
+        self.vqa_ansatz = None
+        self.vqa_optimizer = None
         self.ibmq_credential = None
         self.ibmq_runtime_program_options = None
-        self.quantum_circuits = None
-    
+        self.vqa_circuits = None
+
+        self.qubo_num_qbits = None
+        self.qubo_num_reads = None
 
         if check_redundancy:
             nDegens = self.count_degens(assume_redundant=False)
@@ -767,37 +769,37 @@ class RedundantCalibrator:
                 eqs['g_%d_%s * g_%d_%s_ * u_%d_%s' % params] = (ant_i, ant_j, pol)
         return eqs
 
-    def set_quantum_backend(self, backend):
+    def set_ibmq_backend(self, backend):
         """Set the backend
 
         Args:
             backend (_type_): _description_
         """
-        self.quantum_backend = backend
+        self.ibmq_backend = backend
 
-    def set_quantum_ansatz(self, ansatz):
+    def set_vqa_ansatz(self, ansatz):
         """_summary_
 
         Args:
             ansatz (_type_): _description_
         """
-        self.quantum_ansatz = ansatz
+        self.vqa_ansatz = ansatz
 
-    def set_quantum_optimizer(self, opt):
+    def set_vqa_optimizer(self, opt):
         """_summary_
 
         Args:
             opt (_type_): _description_
         """
-        self.quantum_optimizer = opt
+        self.vqa_optimizer = opt
 
-    def set_quantum_circuits(self, circuits):
+    def set_vqa_circuits(self, circuits):
         """_summary_
 
         Args:
             circuits (_type_): _description_
         """
-        self.quantum_circuits = circuits
+        self.vqa_circuits = circuits
 
     def set_ibmq_credential(self, ibmq_token=None, hub=None, group=None, project=None):
         """_summary_
@@ -821,6 +823,22 @@ class RedundantCalibrator:
         """
         self.ibmq_runtime_program_options={"program_id":program_id}
         self.ibmq_runtime_program_options.update(kwargs)
+
+    def set_qubo_num_qbits(self, nqbit):
+        """_summary_
+
+        Args:
+            nqbit (_type_): _description_
+        """
+        self.qubo_num_qbits = nqbit
+
+    def set_qubo_num_reads(self, num_reads):
+        """
+
+        Args:
+            num_reads (_type_): _description_
+        """
+        self.qubo_num_reads = num_reads 
 
     def _solver(self, solver, data, wgts={}, detrend_phs=False, **kwargs):
         """Instantiates a linsolve solver for performing redcal.
@@ -953,13 +971,17 @@ class RedundantCalibrator:
         ls = linsolve.LinearSolver(d_ls, wgts=w_ls, sparse=sparse)
 
 
-        if mode in ls.quantum_solvers:
-            ls.set_quantum_backend(self.quantum_backend)
-            ls.set_quantum_ansatz(self.quantum_ansatz)
-            ls.set_quantum_optimizer(self.quantum_optimizer)
+        if mode in ls.vqa_solvers:
+            ls.set_ibmq_backend(self.ibmq_backend)
+            ls.set_vqa_ansatz(self.vqa_ansatz)
+            ls.set_vqa_optimizer(self.vqa_optimizer)
             ls.set_ibmq_credential(self.ibmq_credential)
             ls.set_ibmq_runtime_program_options(self.ibmq_runtime_program_options)
-            ls.set_quantum_circuits(self.quantum_circuits)
+            ls.set_vqa_circuits(self.vqa_circuits)
+
+        if mode in ls.qubo_solvers:
+            ls.set_qubo_num_qbits(self.qubo_num_qbits)
+            ls.set_qubo_num_reads(self.qubo_num_reads)
 
         sol = ls.solve(mode=mode, matrix_columns=baseline_pairs)
         dly_sol = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}

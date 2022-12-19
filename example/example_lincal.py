@@ -28,13 +28,13 @@ from qiskit_ibm_runtime import QiskitRuntimeService
 
 
 
-vqls = False
-qubo = True
+solver = 'vqls'
 
 NANTS = 8
 NFREQ = 64
 antpos = linear_array(NANTS)
 baseline_pairs = int(np.math.factorial(NANTS-1)/2/np.math.factorial(NANTS-3))
+baseline_pairs = None
 # circuits = QuantumCircuitsLinearArray(NANTS, NFREQ)
 
 reds = om.get_reds(antpos, pols=['xx'], pol_mode='1pol')
@@ -70,14 +70,15 @@ for i in range(NANTS):
     assert dly_sol_ref[(i, 'Jxx')].shape == (1, 1)
     assert np.allclose(np.round(sol_degen_ref[(i, 'Jxx')] - delays[(i, 'Jxx')], 0), 0)
 
-if vqls:
+if solver == 'vqls':
     
-    info.set_quantum_backend(Aer.get_backend('aer_simulator_statevector'))
+    info.set_ibmq_backend(Aer.get_backend('aer_simulator_statevector'))
     num_qubits = int(np.ceil(np.log2(NANTS)))
-    info.set_quantum_ansatz(RealAmplitudes(num_qubits, entanglement='full' , reps=3, insert_barriers=False))
-    info.set_quantum_optimizer(COBYLA(maxiter=250, disp=True))
+    info.set_vqa_ansatz(RealAmplitudes(num_qubits, entanglement='full' , 
+                                       reps=3, insert_barriers=False))
+    info.set_vqa_optimizer(COBYLA(maxiter=250, disp=True))
 
-    # info.set_quantum_circuits(circuits)
+    # info.set_vqa_circuits(circuits)
 
     # info.set_ibmq_credential(ibmq_token="",
     #                          hub="ibm-q-qal", 
@@ -93,8 +94,10 @@ if vqls:
                                                 baseline_pairs=baseline_pairs)
 
 
-elif qubo:
+elif solver == 'qubols':
 
+    info.set_qubo_num_qbits(11)
+    info.set_qubo_num_reads(1000)
     dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
                                                 medfilt=False, 
                                                 mode='qubols')
@@ -102,6 +105,7 @@ elif qubo:
 dly = [dly_sol[(i, 'Jxx')] for i in range(NANTS)]
 dly_ref = np.array([dly_sol_ref[(i, 'Jxx')] for i in range(NANTS)])
 # dly_ref /= np.linalg.norm(dly_ref)
+# dly /= np.linalg.norm(dly)
 print(dly)
 print(dly_ref)
 plt.scatter(dly_ref, dly)
