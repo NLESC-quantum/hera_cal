@@ -6,7 +6,7 @@ import os
 import sys
 import shutil
 
-from hera_sim.antpos import linear_array, hex_array
+from hera_sim.antpos import linear_array, hex_array, HexArray
 from hera_sim.vis import sim_red_data
 from hera_sim.sigchain import gen_gains
 
@@ -26,14 +26,16 @@ import matplotlib.pyplot as plt
 from qiskit_ibm_runtime import QiskitRuntimeService
 
 
+hex_array = HexArray(split_core=True, outriggers=0)
 
 
 solver = 'vqls'
 
-NANTS = 8
+NANTS = 16
 NFREQ = 64
 antpos = linear_array(NANTS)
-baseline_pairs = int(np.math.factorial(NANTS-1)/2/np.math.factorial(NANTS-3))
+# antpos = hex_array(NANTS)
+# baseline_pairs = int(np.math.factorial(NANTS-1)/2/np.math.factorial(NANTS-3))
 baseline_pairs = None
 # circuits = QuantumCircuitsLinearArray(NANTS, NFREQ)
 
@@ -65,18 +67,18 @@ dly_sol_ref, off_sol_ref = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fq
 
 sol_degen_ref = info.remove_degen_gains(dly_sol_ref, degen_gains=delays, mode='phase')
 
-for i in range(NANTS):
-    assert dly_sol_ref[(i, 'Jxx')].dtype == np.float64
-    assert dly_sol_ref[(i, 'Jxx')].shape == (1, 1)
-    assert np.allclose(np.round(sol_degen_ref[(i, 'Jxx')] - delays[(i, 'Jxx')], 0), 0)
+# for i in range(NANTS):
+#     assert dly_sol_ref[(i, 'Jxx')].dtype == np.float64
+#     assert dly_sol_ref[(i, 'Jxx')].shape == (1, 1)
+#     assert np.allclose(np.round(sol_degen_ref[(i, 'Jxx')] - delays[(i, 'Jxx')], 0), 0)
 
 if solver == 'vqls':
     
     info.set_ibmq_backend(Aer.get_backend('aer_simulator_statevector'))
     num_qubits = int(np.ceil(np.log2(NANTS)))
-    info.set_vqa_ansatz(RealAmplitudes(num_qubits, entanglement='full' , 
+    info.set_vqls_ansatz(RealAmplitudes(num_qubits, entanglement='full' , 
                                        reps=3, insert_barriers=False))
-    info.set_vqa_optimizer(COBYLA(maxiter=250, disp=True))
+    info.set_vqls_optimizer(COBYLA(maxiter=250, disp=True))
 
     # info.set_vqa_circuits(circuits)
 

@@ -739,11 +739,12 @@ class RedundantCalibrator:
         self.pol_mode = parse_pol_mode(self.reds)
 
         self.ibmq_backend = None
-        self.vqa_ansatz = None
-        self.vqa_optimizer = None
+        self.vqls_ansatz = None
+        self.vqls_optimizer = None
+        self.vqls_options = None
         self.ibmq_credential = None
         self.ibmq_runtime_program_options = None
-        self.vqa_circuits = None
+
 
         self.qubo_num_qbits = None
         self.qubo_num_reads = None
@@ -773,33 +774,33 @@ class RedundantCalibrator:
         """Set the backend
 
         Args:
-            backend (_type_): _description_
+            backend (IBM backend): the backend to use
         """
         self.ibmq_backend = backend
 
-    def set_vqa_ansatz(self, ansatz):
-        """_summary_
+    def set_vqls_ansatz(self, ansatz):
+        """Set the circuit ansatz to use for solving the linear system
 
         Args:
-            ansatz (_type_): _description_
+            ansatz (QuantumCircuit): variational circuit
         """
-        self.vqa_ansatz = ansatz
+        self.vqls_ansatz = ansatz
 
-    def set_vqa_optimizer(self, opt):
-        """_summary_
+    def set_vqls_optimizer(self, opt):
+        """Set the optimizer to be used during the optimization
 
         Args:
-            opt (_type_): _description_
+            opt (qiskit.optimizer): the optimizer
         """
-        self.vqa_optimizer = opt
-
-    def set_vqa_circuits(self, circuits):
-        """_summary_
+        self.vqls_optimizer = opt
+        
+    def set_vqls_options(self, opt):
+        """set the options for VQLS
 
         Args:
-            circuits (_type_): _description_
+            opt (dict): options
         """
-        self.vqa_circuits = circuits
+        self.vqls_options = opt
 
     def set_ibmq_credential(self, ibmq_token=None, hub=None, group=None, project=None):
         """_summary_

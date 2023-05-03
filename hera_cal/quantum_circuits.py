@@ -4,9 +4,6 @@ from qiskit import QuantumCircuit
 
 def QuantumCircuitsLinearArray(nant, nfreq):
 
-    def _init_two(nfreq):
-        raise NotImplemented('Not implmented for 3 antennas')
-
 
     def _init_four(nfreq):
 
@@ -49,8 +46,7 @@ def QuantumCircuitsLinearArray(nant, nfreq):
 
         return circuits, coefficients
 
-    init_fn = {2 : _init_two,
-               4 : _init_four}
+    init_fn = {4 : _init_four}
 
     if nant not in init_fn.keys():
         raise ValueError("Not implmented for %d antennas" %nant)
