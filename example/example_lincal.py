@@ -1,42 +1,27 @@
 
 import numpy as np
-from copy import deepcopy
-import warnings
-import os
-import sys
-import shutil
-
-from hera_sim.antpos import linear_array, hex_array, HexArray
+from hera_sim.antpos import linear_array
 from hera_sim.vis import sim_red_data
 from hera_sim.sigchain import gen_gains
 
 from hera_cal import redcal as om
-from hera_cal import io, abscal
-from hera_cal.utils import split_pol, conj_pol, split_bl
 from hera_cal.apply_cal import calibrate_in_place
-from hera_cal.data import DATA_PATH
-from hera_cal.datacontainer import DataContainer
-from hera_cal.quantum_circuits import QuantumCircuitsLinearArray
 
 
 from qiskit.circuit.library.n_local.real_amplitudes import RealAmplitudes
-from qiskit.algorithms.optimizers import COBYLA
-from qiskit import Aer
+from qiskit.algorithms import optimizers as opt
 import matplotlib.pyplot as plt
-from qiskit_ibm_runtime import QiskitRuntimeService
 
 
-hex_array = HexArray(split_core=True, outriggers=0)
 
 
-solver = 'vqls'
+solver = 'vqls_runtime'
 
-NANTS = 16
+NANTS = 4
 NFREQ = 64
 antpos = linear_array(NANTS)
 # antpos = hex_array(NANTS)
 # baseline_pairs = int(np.math.factorial(NANTS-1)/2/np.math.factorial(NANTS-3))
-baseline_pairs = None
 # circuits = QuantumCircuitsLinearArray(NANTS, NFREQ)
 
 reds = om.get_reds(antpos, pols=['xx'], pol_mode='1pol')
@@ -62,8 +47,7 @@ d = {k: v.astype(np.complex64) for k, v in d.items()}
 
 dly_sol_ref, off_sol_ref = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
                                             medfilt=False, 
-                                            mode='solve',
-                                            baseline_pairs=baseline_pairs)
+                                            mode='solve')
 
 sol_degen_ref = info.remove_degen_gains(dly_sol_ref, degen_gains=delays, mode='phase')
 
@@ -74,27 +58,27 @@ sol_degen_ref = info.remove_degen_gains(dly_sol_ref, degen_gains=delays, mode='p
 
 if solver == 'vqls':
     
-    info.set_ibmq_backend(Aer.get_backend('aer_simulator_statevector'))
     num_qubits = int(np.ceil(np.log2(NANTS)))
-    info.set_vqls_ansatz(RealAmplitudes(num_qubits, entanglement='full' , 
-                                       reps=3, insert_barriers=False))
-    info.set_vqls_optimizer(COBYLA(maxiter=250, disp=True))
+    info.set_vqls_ansatz(RealAmplitudes(num_qubits, entanglement='full', reps=3, insert_barriers=False))
+    info.set_vqls_optimizer(opt.COBYLA(maxiter=250, disp=True))
 
-    # info.set_vqa_circuits(circuits)
-
-    # info.set_ibmq_credential(ibmq_token="",
-    #                          hub="ibm-q-qal", 
-    #                          group="escience", 
-    #                          project="qradio")
-
-    # info.set_ibmq_runtime_program_options(program_id='vqls-Ejz5ewL0gW', 
-    #                                       shots=2500)
 
     dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
                                                 medfilt=False, 
-                                                mode='vqls',
-                                                baseline_pairs=baseline_pairs)
+                                                mode='vqls')
 
+elif solver == 'vqls_runtime':
+
+    
+    num_qubits = int(np.ceil(np.log2(NANTS)))
+    info.set_vqls_ansatz(RealAmplitudes(num_qubits, entanglement='full', reps=3, insert_barriers=False))
+    info.set_vqls_optimizer(opt.COBYLA(maxiter=5, disp=True))
+    info.set_ibmq_backend('simulator_statevector')
+
+
+    dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
+                                                medfilt=False, 
+                                                mode='vqls_runtime')
 
 elif solver == 'qubols':
 
