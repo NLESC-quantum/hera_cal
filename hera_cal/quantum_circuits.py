@@ -1,4 +1,4 @@
-from qalcore.qiskit.vqls.numpy_unitary_matrices import UnitaryDecomposition 
+from qalcore.qiskit.vqls.matrix_decomposition import SymmetricDecomposition 
 from qiskit import QuantumCircuit
 
 
@@ -52,7 +52,7 @@ def QuantumCircuitsLinearArray(nant, nfreq):
         raise ValueError("Not implmented for %d antennas" %nant)
 
     circuits, coefficients = init_fn[nant](nfreq)
-    return UnitaryDecomposition(circuits=circuits, coefficients=coefficients)
+    return SymmetricDecomposition(circuits=circuits, coefficients=coefficients)
 
         
 

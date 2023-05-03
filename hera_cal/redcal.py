@@ -743,7 +743,6 @@ class RedundantCalibrator:
         self.vqls_optimizer = None
         self.vqls_options = None
         self.ibmq_credential = None
-        self.ibmq_runtime_program_options = None
 
 
         self.qubo_num_qbits = None
@@ -803,7 +802,7 @@ class RedundantCalibrator:
         self.vqls_options = opt
 
     def set_ibmq_credential(self, ibmq_token=None, hub=None, group=None, project=None):
-        """_summary_
+        """set the IBMQ credential
 
         Args:
             ibmq_token (_type_, optional): _description_. Defaults to None.
@@ -816,28 +815,19 @@ class RedundantCalibrator:
                                "group":group,
                                "project":project}
 
-    def set_ibmq_runtime_program_options(self, program_id, **kwargs):
-        """_summary_
-
-        Args:
-            program_id (_type_): _description_
-        """
-        self.ibmq_runtime_program_options={"program_id":program_id}
-        self.ibmq_runtime_program_options.update(kwargs)
-
     def set_qubo_num_qbits(self, nqbit):
-        """_summary_
+        """set the number of qubits used to encode each real in QUBO
 
         Args:
-            nqbit (_type_): _description_
+            nqbit (int): number of qubits used for encoding reals
         """
         self.qubo_num_qbits = nqbit
 
     def set_qubo_num_reads(self, num_reads):
-        """
+        """Set the number of reads of the circuits
 
         Args:
-            num_reads (_type_): _description_
+            num_reads (int): number of reads
         """
         self.qubo_num_reads = num_reads 
 
@@ -972,13 +962,11 @@ class RedundantCalibrator:
         ls = linsolve.LinearSolver(d_ls, wgts=w_ls, sparse=sparse)
 
 
-        if mode in ls.vqa_solvers:
+        if mode in ls.vqls_solvers:
             ls.set_ibmq_backend(self.ibmq_backend)
-            ls.set_vqa_ansatz(self.vqa_ansatz)
-            ls.set_vqa_optimizer(self.vqa_optimizer)
+            ls.set_vqls_ansatz(self.vqls_ansatz)
+            ls.set_vqls_optimizer(self.vqls_optimizer)
             ls.set_ibmq_credential(self.ibmq_credential)
-            ls.set_ibmq_runtime_program_options(self.ibmq_runtime_program_options)
-            ls.set_vqa_circuits(self.vqa_circuits)
 
         if mode in ls.qubo_solvers:
             ls.set_qubo_num_qbits(self.qubo_num_qbits)
