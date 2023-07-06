@@ -60,7 +60,8 @@ if solver == 'vqls':
     
     num_qubits = int(np.ceil(np.log2(NANTS)))
     info.set_vqls_ansatz(RealAmplitudes(num_qubits, entanglement='full', reps=3, insert_barriers=False))
-    info.set_vqls_optimizer(opt.COBYLA(maxiter=250, disp=True))
+    info.set_vqls_optimizer(opt.COBYLA(maxiter=250))
+    info.set_vqls_options({"matrix_decomposition":'pauli', 'shots': 10000})
 
 
     dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 
@@ -72,8 +73,11 @@ elif solver == 'vqls_runtime':
     
     num_qubits = int(np.ceil(np.log2(NANTS)))
     info.set_vqls_ansatz(RealAmplitudes(num_qubits, entanglement='full', reps=3, insert_barriers=False))
-    info.set_vqls_optimizer(opt.COBYLA(maxiter=5, disp=True))
-    info.set_ibmq_backend('simulator_statevector')
+    info.set_vqls_optimizer(opt.COBYLA(maxiter=250))
+    info.set_vqls_options({"matrix_decomposition":'pauli', "shots":10000})
+    info.set_ibmq_backend('ibmq_qasm_simulator')
+    # info.set_ibmq_backend('simulator_statevector')
+    # info.set_ibmq_backend('ibmq_guadalupe')
 
 
     dly_sol, off_sol = info._firstcal_iteration(d, df=fqs[1] - fqs[0], f0=fqs[0], 

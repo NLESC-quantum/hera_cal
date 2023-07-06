@@ -967,6 +967,7 @@ class RedundantCalibrator:
             ls.set_vqls_ansatz(self.vqls_ansatz)
             ls.set_vqls_optimizer(self.vqls_optimizer)
             ls.set_ibmq_credential(self.ibmq_credential)
+            ls.set_vqls_options(self.vqls_options)
 
         if mode in ls.qubo_solvers:
             ls.set_qubo_num_qbits(self.qubo_num_qbits)
