@@ -22,6 +22,11 @@ from . import utils
 from . import flag_utils
 from .vis_clean import truncate_flagged_edges, restore_flagged_edges
 from .noise import interleaved_noise_variance_estimate
+from .nucal import _linear_fit
+
+import jax
+from jax import numpy as jnp
+jax.config.update("jax_enable_x64", True)
 
 
 def single_iterative_fft_dly(gains, wgts, freqs, conv_crit=1e-5, maxiter=100):
@@ -62,6 +67,33 @@ def single_iterative_fft_dly(gains, wgts, freqs, conv_crit=1e-5, maxiter=100):
     return np.sum(taus)
 
 
+def detect_phase_flips(phases):
+    """Detect phases that are flipped relative to the first unflagged integration.
+
+    Arguments:
+        phases: phases in radians. Will handle phase wraps and phase starting point (-pi, 0, etc.)
+            automatically. Flagged integrations should be np.nan.
+
+    Returns:
+        phase_flipped: boolean array the same shape as phases where True means pi radians flipped
+            relative to the first unflagged phase.
+    """
+    original_shape = np.array(phases).shape
+    complexes = np.exp(1.0j * np.ravel(phases))
+    phase_flipped = np.zeros(len(complexes), dtype=bool)
+    currently_flipped = False
+    previous_non_nan = np.nan  # ensures that first non-nan integration is not flipped
+    for i in range(len(complexes)):
+        if not np.isnan(complexes[i]):
+            flip_here = np.abs(complexes[i] - previous_non_nan) > np.abs(complexes[i] + previous_non_nan)
+            phase_flipped[i] = currently_flipped ^ flip_here
+            currently_flipped = phase_flipped[i]
+            previous_non_nan = complexes[i]
+        else:
+            phase_flipped[i] = currently_flipped
+    return phase_flipped.reshape(original_shape)
+
+
 def dpss_filters(freqs, times, freq_scale=10, time_scale=1800, eigenval_cutoff=1e-9):
     """Generate a set of 2D discrete prolate spheroidal sequence (DPSS) filters
     to filter calibration solutions along the time and frequency axes simultaneously.
@@ -86,25 +118,18 @@ def dpss_filters(freqs, times, freq_scale=10, time_scale=1800, eigenval_cutoff=1
     fringe_scale = (time_scale) ** -1  # fringe scale in Hz
     time_in_seconds = (times - times.min()) * 60 * 60 * 24  # time array in seconds
 
-    dpss_windows = []
+    # Compute the time and frequency filters using hera_filters
+    time_filters = hera_filters.dspec.dpss_operator(
+        time_in_seconds, [0], [fringe_scale], eigenval_cutoff=[eigenval_cutoff]
+    )[0].real
+    freq_filters = hera_filters.dspec.dpss_operator(
+        freqs, [0], [delay_scale], eigenval_cutoff=[eigenval_cutoff]
+    )[0].real
 
-    for x0, fw in zip([time_in_seconds, freqs], [fringe_scale, delay_scale]):
-        nf = x0.shape[0]
-        df = np.abs(x0[1] - x0[0])
-        W = nf * fw * df
-
-        # Estimate the number of eigenvalues > eigenval_cutoff - Slepian 1978 + Karnik 2020
-        Nw = 2 * W + 2 / np.pi ** 2 * np.log(4 * nf) * np.log(4 / (eigenval_cutoff * (1 - eigenval_cutoff)))
-
-        # Generate DPSS vectors and keep vectors with eigenvalues greater than eigenval_cutoff
-        windows, eigvals = hera_filters.dspec.windows.dpss(nf, W, int(min(Nw, nf)), return_ratios=True)
-        windows = windows[eigvals > eigenval_cutoff].T
-        dpss_windows.append(windows)
-
-    return dpss_windows[0], dpss_windows[1]
+    return time_filters, freq_filters
 
 
-def solve_2D_DPSS(gains, weights, time_filters, freq_filters, XTXinv=None):
+def solve_2D_DPSS(gains, weights, time_filters, freq_filters, method="pinv", cached_input={}):
     """
     Filters gain solutions by solving the weighted linear least squares problem
     for a design matrix that can be factored by a kronecker product in the following way
@@ -122,42 +147,55 @@ def solve_2D_DPSS(gains, weights, time_filters, freq_filters, XTXinv=None):
             obtained from hera_cal.smooth_cal.dpss_filters
         freq_filters: DPSS filtering vectors along the frequency axis, (Nfreqs, N_freq_vectors)
             obtained from hera_cal.smooth_cal.dpss_filters
-        XTXinv: Matrix of (X^T W X)^{-1} for the input DPSS filters and weights. Useful for filtering
-            many gain grids with similar flagging patterns. np.ndarray of shape (N_time_vectors * N_freq_vectors,
-            N_time_vectors * N_freq_vectors)
+        method: method to use for solving the linear least squares problem. Options are 'pinv', 'lstsq', 'lu_solve', and 'solve'.
+            'pinv' uses np.linalg.pinv to compute the least squares solution and tends to be the most reliable. 'lu_solve'
+            uses scipy.linalg.lu_solve to compute the least squares solution and tends to be the fastest.
+            'solve' uses np.linalg.solve and 'lstsq' uses np.linalg.lstsq and have comparable results.
+        cached_input: Dictionary of intermediate products computed when performing linear least-squares with the DPSS basis vectors.
+            Useful for filtering many gain grids with similar flagging patterns. Can be obtained using
+            the 'cached_output' return value from a previous call to this function, 'cached_output'. If method is 'lu_solve',
+            cached_input will have an additional key 'LU' which is the output of scipy.linalg.lu_factor. If method
+            is 'pinv', cached_input will have an additional key 'XTXinv' which is the output of np.linalg.pinv. If
+            other methods are used, nucal._linear_fit will not use cached_input.
 
     Returns:
         filtered: filtered gain grids from least squares fit, np.ndarray with the
             same shape as the input gain grid
-        info: dictionary containing fit components and XTXinv
+        cached_output: dictionary containing intermediated cached products for linear fitting. Useful
+            for use in subsequent filtering if the input gains have the same flagging pattern previous input gains.
+            Keys are 'XTXinv' and 'LU' for 'pinv' and 'lu_solve' methods respectively, where 'XTXinv' is the pinv of the
+            design matrix and 'LU' is the output of scipy.linalg.lu_factor. If other methods are used, cached_output
+            will be an empty dictionary.
     """
-    # If (X^T W X)^-1 is not precalculated, calculate it
-    if XTXinv is None:
-        # Make sure data types between weights and filters are compatible for einsum optimization
-        weights = weights.astype(time_filters.dtype)
+    # Make sure data types between weights and filters are compatible for einsum optimization
+    weights = weights.astype(time_filters.dtype)
 
-        # Use einsum to calculate (X^T W X) in a memory efficient way
-        XTX = np.einsum(
-            "ij,kl,jl,jm,ln->ikmn", np.transpose(time_filters), np.transpose(freq_filters),
-            weights, time_filters, freq_filters, optimize=True
+    # Calculate the number of components in the design matrix
+    ncomps = time_filters.shape[1] * freq_filters.shape[1]
+
+    if ("LU" in cached_input and method == "lu_solve") or ("XTXinv" in cached_input and method == "pinv"):
+        # If cached_input is provided and method is 'lu_solve' or 'pinv', create a dummy variable to pass to _linear_fit
+        XTX = np.zeros((1, 1))
+    else:
+        # Use jax einsum to calculate (X^T W X) in a memory efficient way
+        # einsum indices are (t -> time, f -> freq, i > time filter index, j -> freq filter index, m ->
+        # time filter index, n -> freq filter index)
+        XTX = jnp.einsum(
+            "ti,fj,tf,tm,fn->ijmn", time_filters, freq_filters, weights, time_filters, freq_filters, optimize=True
         )
-        ncomps = time_filters.shape[1] * freq_filters.shape[1]
         XTX = np.reshape(XTX, (ncomps, ncomps))
-        XTXinv = np.linalg.pinv(XTX)
 
     # Calculate X^T W y using the property (A \otimes B) vec(y) = (A Y B)
-    XTWy = np.ravel(np.transpose(time_filters) @ (gains * weights) @ freq_filters)
+    XTWy = jnp.ravel(jnp.dot(jnp.dot(jnp.transpose(time_filters), (gains * weights)), freq_filters))
 
-    # Calculate beta
-    beta = np.reshape(XTXinv @ XTWy, (time_filters.shape[1], freq_filters.shape[1]))
+    # Compute beta and reshape into a 2D array
+    beta, cached_output = _linear_fit(XTX, XTWy, solver=method, cached_input=cached_input)
+    beta = np.reshape(beta, (time_filters.shape[1], freq_filters.shape[1]))
 
     # Produce an estimate of the filtered gains
-    filtered = time_filters @ beta @ np.transpose(freq_filters)
+    filtered = np.dot(np.dot(time_filters, beta), np.transpose(freq_filters))
 
-    # Dictionary for storing fitting information
-    info = {"beta": beta, "XTXinv": XTXinv}
-
-    return filtered, info
+    return filtered, cached_output
 
 
 def filter_1d(gains, wgts, xvals, filter_scale=None, skip_wgt=0.1, ax='freq',
@@ -292,8 +330,8 @@ def time_filter(gains, wgts, times, filter_scale=1800.0, nMirrors=0):
 
 def time_freq_2D_filter(gains, wgts, freqs, times, freq_scale=10.0, time_scale=1800.0,
                         tol=1e-09, filter_mode='rect', maxiter=100, window='tukey', method='CLEAN',
-                        dpss_vectors=None, XTXinv=None, eigenval_cutoff=1e-9, skip_flagged_edges=True,
-                        **win_kwargs):
+                        dpss_vectors=None, fit_method="pinv", cached_input={}, eigenval_cutoff=1e-9,
+                        skip_flagged_edges=True, fix_phase_flips=False, **win_kwargs):
     '''Filter calibration solutions in both time and frequency simultaneously. First rephases to remove
     a time-average delay from the gains, then performs the low-pass 2D filter in time and frequency,
     then puts back in the delay rephasor. Uses aipy.deconv.clean to account for weights/flags.
@@ -325,21 +363,31 @@ def time_freq_2D_filter(gains, wgts, freqs, times, freq_scale=10.0, time_scale=1
             that form the least squares design matrix, X, when the outer product of the two is taken.
             If dpss_vectors is not provided, one will be calculated using smooth_cal.dpss_filters and the
             time and frequency scale. Only used when the method is 'DPSS'
-        XTXinv: Matrix operation of (X^T W X)^{-1} where X are the set of 2D DPSS vectors and W is the
-            wgts grid. Useful when filtering many gain grids where wgts grid is the same between two or more
-            gain solutions. Only used when the filtering method is 'DPSS'
+        fit_method: Method used to fit the DPSS model to the data. Either 'lstsq', 'pinv', 'lu_solve', or 'solve'.
+            Only used when the filtering method is 'DPSS'. 'lu_solve' tends to be the fastest, but 'pinv' is more
+            stable.
+        cached_input: Dictionary of intermediate products computed when performing linear least-squares with the DPSS basis vectors.
+            Useful for filtering many gain grids with similar flagging patterns. Can be obtained using
+            the 'cached_output' return value from a previous call to the solve_2D_DPSS function and can also be found the 'info' dictionary
+            returned by this function. If method is 'lu_solve', cached_input will have a key 'LU' which is the output of scipy.linalg.lu_factor.
+            If method is 'pinv', cached_input will have a key 'XTXinv' which is the output of np.linalg.pinv. If
+            other methods are used, nucal._linear_fit will not use cached_input.
         eigenval_cutoff: sinc_matrix eigenvalue cutoffs to use for included dpss modes.
             Only used when the filtering method is 'DPSS'
         skip_flagged_edges : bool, optional
             if True, do not filter over flagged edge times/freqs (filter over sub-region). Only used when method used is 'DPSS'.
             Default is True
+        fix_phase_flips : bool, optional
+            If True, will try to find integrations whose phases appear to be 180 degrees rotated from the first unflagged
+            integration. These will be flipped before smoothing and then flipped back after smoothing. Default is False.
         win_kwargs : any keyword arguments for the window function selection in aipy.dsp.gen_window.
             Currently, the only window that takes a kwarg is the tukey window with a alpha=0.5 default.
 
     Returns:
         filtered: filtered gains, ndarray of shape=(Ntimes,Nfreqs)
-        info: dictionary of metadata from aipy.deconv.clean or DPSS, depending on the filter method
-            chosen.
+        info: dictionary of metadata from aipy.deconv.clean or DPSS, depending on the filter method chosen.
+            If fix_phase_flips is True, contains an length-Ntimes phase_flips array of 1s for unflipped integrations
+            and -1s for integrations flipped relative to the first.
     '''
     df = np.median(np.diff(freqs))
     dt = np.median(np.diff(times)) * 24.0 * 3600.0  # in seconds
@@ -348,9 +396,22 @@ def time_freq_2D_filter(gains, wgts, freqs, times, freq_scale=10.0, time_scale=1
     delay_scale = (freq_scale * 1e6)**-1  # Puts it in seconds
     fringe_scale = (time_scale)**-1  # in Hz
 
-    # Build rephasor to take out average delay
-    dly = single_iterative_fft_dly(gains, wgts, freqs)  # dly in seconds
-    rephasor = np.exp(-2.0j * np.pi * dly * freqs)
+    # Build rephasor to take out average delay and handle phase flips
+    dly = single_iterative_fft_dly(gains, wgts, freqs)
+    rephasor = rephasor = np.exp(-2.0j * np.pi * dly * freqs)
+    if fix_phase_flips:
+        # average delay-rephased gain, compute phase of average, and then find phase flips
+        avg_rephased_gain = np.ma.average(gains * rephasor, weights=wgts, axis=1, keepdims=True)
+        phases = np.where(avg_rephased_gain.mask, np.nan, np.angle(avg_rephased_gain))
+        phase_flips = np.where(detect_phase_flips(phases), -1, 1)
+        if np.any(phase_flips == -1):
+            # recompute single dly
+            dly = single_iterative_fft_dly(phase_flips * gains, wgts, freqs)
+            rephasor = np.exp(-2.0j * np.pi * dly * freqs)
+    else:
+        phase_flips = np.ones_like(times)[:, np.newaxis]
+    # include phase_flips in rephasor
+    rephasor = phase_flips * rephasor
 
     if method == 'DPSS' or method == 'dpss_leastsq':
         info = {}
@@ -370,11 +431,13 @@ def time_freq_2D_filter(gains, wgts, freqs, times, freq_scale=10.0, time_scale=1
                     eigenval_cutoff=eigenval_cutoff
                 )
 
+            # Unpack DPSS vectors
             time_filters, freq_filters = dpss_vectors
 
             # Filter gain solutions
-            filtered, fit_info = solve_2D_DPSS(
-                gains=gout, weights=wout, time_filters=time_filters, freq_filters=freq_filters, XTXinv=XTXinv
+            filtered, cached_output = solve_2D_DPSS(
+                gains=gout, weights=wout, time_filters=time_filters, freq_filters=freq_filters, method=fit_method,
+                cached_input=cached_input
             )
 
             if skip_flagged_edges:
@@ -386,8 +449,8 @@ def time_freq_2D_filter(gains, wgts, freqs, times, freq_scale=10.0, time_scale=1
                 filtered = restore_flagged_edges(filtered, chunks, edges, ax='both')
                 filtered[mask] = gains[mask]
 
-            # Store design matrices and XTXinv for computational speed-up
-            info['XTXinv'] = fit_info['XTXinv']
+            # Store design matrices and cached matrices for computational speed-up
+            info['cached_input'] = cached_output
             info['dpss_vectors'] = dpss_vectors
 
         elif filter_mode == 'plus':
@@ -422,6 +485,7 @@ def time_freq_2D_filter(gains, wgts, freqs, times, freq_scale=10.0, time_scale=1
     else:
         raise ValueError("Filter method {} not recognized. Must be 'CLEAN' or 'DPSS'".format(method))
 
+    info['phase_flips'] = np.squeeze(phase_flips)
     return filtered / rephasor, info
 
 
@@ -535,7 +599,7 @@ def rephase_to_refant(gains, refant, flags=None, propagate_refant_flags=False):
             is not flagged, a ValueError will be raised.
     '''
     for pol, ref in (refant.items() if not isinstance(refant, tuple) else [(None, refant)]):
-        refant_phasor = gains[ref] / np.abs(gains[ref])
+        refant_phasor = np.exp(-1.0j * np.angle(gains[ref]))
         for ant in gains.keys():
             if ((pol is None) or (ant[1] == pol)):
                 if flags is not None:
@@ -544,7 +608,7 @@ def rephase_to_refant(gains, refant, flags=None, propagate_refant_flags=False):
                     elif np.any(flags[ref][np.logical_not(flags[ant])]):
                         raise ValueError('The chosen reference antenna', refant, 'is flagged in at least one place where antenna',
                                          ant, 'is not, so automatic reference antenna selection has failed.')
-                gains[ant] = gains[ant] / refant_phasor
+                gains[ant] = gains[ant] * refant_phasor
 
 
 def build_time_blacklist(time_grid, time_blacklists=[], lst_blacklists=[], lat_lon_alt_degrees=None, telescope_name='HERA'):
@@ -640,11 +704,35 @@ def _build_wgts_grid(flag_grid, time_blacklist=None, freq_blacklist=None, blackl
     return wgts_grid
 
 
+def _to_antflags(flags, ants, antflag_thresh):
+    '''Converts flag dictionaries or data containers that are potentially
+    per-baseline or per antpol to per-antenna flags.'''
+    if np.all([isinstance(k, str) for k in flags]):
+        # per-antpol flag waterfalls need to be up-converted into per-antenna flags
+        return {ant: np.array(flags[ant[1]]) for ant in ants if ant[1] in flags}
+    elif np.all([len(k) == 2 for k in flags]):
+        # it already was per-antenna flags
+        return flags
+    else:
+        # per-baseline flags need to be down-converted into per-antenna flags
+        return flag_utils.synthesize_ant_flags(flags, threshold=antflag_thresh)
+
+
+def _check_finite_gains(gains, flags):
+    '''Make sure there are no unflagged infs or nans in gains, replace flagged ones with 1.0s.'''
+    not_finite = ~np.isfinite(gains)
+    if np.any(not_finite):
+        if not np.all(flags[not_finite]):
+            raise ValueError('There exist unflagged gains that are not finite.')
+        gains[not_finite] = 1.0
+
+
 class CalibrationSmoother():
 
     def __init__(self, calfits_list, flag_file_list=[], flag_filetype='h5', antflag_thresh=0.0, load_cspa=False, load_chisq=False,
                  time_blacklists=[], lst_blacklists=[], lat_lon_alt_degrees=None, freq_blacklists=[], chan_blacklists=[],
-                 blacklist_wgt=0.0, pick_refant=False, freq_threshold=1.0, time_threshold=1.0, ant_threshold=1.0, verbose=False):
+                 blacklist_wgt=0.0, pick_refant=False, propagate_refant_flags=False, freq_threshold=1.0, time_threshold=1.0,
+                 ant_threshold=1.0, ignore_calflags=False, verbose=False):
         '''Class for smoothing calibration solutions in time and frequency for a whole day. Initialized with a list of
         calfits files and, optionally, a corresponding list of flag files, which must match the calfits files
         one-to-one in time. This function sets up a time grid that spans the whole day with dt = integration time.
@@ -656,9 +744,10 @@ class CalibrationSmoother():
 
         Arguments:
             calfits_list: list of string paths to calfits files containing calibration solutions and flags
-            flag_file_list: list of string paths to files containing flags as a function of baseline, times
-                and frequency. Must have all baselines for all times. Flags on baselines are broadcast to both
-                antennas involved, unless either antenna is completely flagged for all times and frequencies.
+            flag_file_list: list of string paths to files containing flags as a function of time, frequency, and
+                either baseline, antenna, or just antenna polarization. Must have all baselines/ants/pols for all times.
+                Flags on baselines are broadcast to both antennas involved, unless either antenna is completely flagged
+                for all times and frequencies.
             flag_filetype: filetype of flag_file_list to pass into io.load_flags. Either 'h5' (default) or legacy 'npz'.
             antflag_thresh: float, fraction of flagged pixels across all visibilities (with a common antenna)
                 needed to flag that antenna gain at a particular time and frequency. antflag_thresh=0.0 is
@@ -688,6 +777,10 @@ class CalibrationSmoother():
                 problems at edge times and frequencies when using DPSS filtering.
             pick_refant: if True, automatically picks one reference anteanna per polarization. The refants chosen have the
                 fewest total flags and causes the least noisy phases on other antennas when made the phase reference.
+            propagate_refant_flags: Default False. If True, update flags so that all antennas are flagged
+                at the specific frequencies and times that the reference antenna is also flagged. If False and
+                there exists times and frequencies where the reference antenna is flagged but another antenna
+                is not flagged, a ValueError will be raised. Ignored if pick_refant is False.
             freq_threshold: float. Finds the times that flagged for all antennas at a single channel but not flagged
                 for all channels. If the ratio of of such times for a given channel compared to all times that are not
                 completely flagged is greater than freq_threshold, flag the entire channel for all antennas.
@@ -699,6 +792,8 @@ class CalibrationSmoother():
             ant_threshold: float. If, after time and freq thesholding and broadcasting, an antenna is left unflagged
                 for a number of visibilities less than ant_threshold times the maximum among all antennas, flag that
                 antenna for all times and channels. Default 1.0 means no additional flagging.
+            ignore_calflags: bool, default False. If True, all times and frequencies with calibration files are assumed
+                to be unflagged unless overridden by external flags provided by flag_file_list.
             verbose: print status updates
         '''
         self.verbose = verbose
@@ -715,6 +810,8 @@ class CalibrationSmoother():
             if load_chisq:
                 chisq[cal] = total_qual
             self.cal_freqs[cal], self.cal_times[cal] = hc.freqs, hc.times
+        self.freqs = self.cal_freqs[self.cals[0]]
+        self.ants = sorted(list(set([k for gain in gains.values() for k in gain.keys()])))
 
         # load flag files
         self.flag_files = flag_file_list
@@ -723,7 +820,7 @@ class CalibrationSmoother():
             self.ext_flags, self.flag_freqs, self.flag_times = {}, {}, {}
             for ff in self.flag_files:
                 flags, meta = io.load_flags(ff, filetype=flag_filetype, return_meta=True)
-                self.ext_flags[ff] = flag_utils.synthesize_ant_flags(flags, threshold=antflag_thresh)
+                self.ext_flags[ff] = _to_antflags(flags, self.ants, antflag_thresh)
                 self.flag_freqs[ff] = meta['freqs']
                 self.flag_times[ff] = meta['times']
 
@@ -738,8 +835,6 @@ class CalibrationSmoother():
             self.flag_time_indices = {ff: np.searchsorted(self.time_grid, times) for ff, times in self.flag_times.items()}
 
         # build empty multi-file grids for each antenna's gains and flags (and optionally for cspa)
-        self.freqs = self.cal_freqs[self.cals[0]]
-        self.ants = sorted(list(set([k for gain in gains.values() for k in gain.keys()])))
         self.gain_grids = {ant: np.ones((len(self.time_grid), len(self.freqs)), dtype=complex) for ant in self.ants}
         self.flag_grids = {ant: np.ones((len(self.time_grid), len(self.freqs)), dtype=bool) for ant in self.ants}
         if load_cspa:
@@ -749,13 +844,15 @@ class CalibrationSmoother():
             for cal in self.cals:
                 if ant in gains[cal]:
                     self.gain_grids[ant][self.time_indices[cal], :] = gains[cal][ant]
-                    self.flag_grids[ant][self.time_indices[cal], :] = cal_flags[cal][ant]
+                    self.flag_grids[ant][self.time_indices[cal], :] = (False if ignore_calflags else cal_flags[cal][ant])
                     if load_cspa:
                         self.cspa_grids[ant][self.time_indices[cal], :] = cspa[cal][ant]
             if len(self.flag_files) > 0:
                 for ff in self.flag_files:
                     if ant in self.ext_flags[ff]:
                         self.flag_grids[ant][self.flag_time_indices[ff], :] += self.ext_flags[ff][ant]
+            # make sure there are no unflagged infs or nans, replace flagged ones with 1.0s
+            _check_finite_gains(self.gain_grids[ant], self.flag_grids[ant])
 
         # Now build grid and fill it for chisq_grid, if desired
         if load_chisq:
@@ -782,7 +879,7 @@ class CalibrationSmoother():
             self.refant = pick_reference_antenna(self.gain_grids, self.flag_grids, self.freqs, per_pol=True)
             utils.echo('\n'.join(['Reference Antenna ' + str(self.refant[pol][0]) + ' selected for ' + pol + '.'
                                   for pol in sorted(list(self.refant.keys()))]), verbose=self.verbose)
-            self.rephase_to_refant()
+            self.rephase_to_refant(propagate_refant_flags=propagate_refant_flags)
 
     def check_consistency(self):
         '''Checks the consistency of the input calibration files (and, if loaded, flag files).
@@ -791,25 +888,26 @@ class CalibrationSmoother():
         '''
         all_time_indices = np.array([i for indices in self.time_indices.values() for i in indices])
         assert len(all_time_indices) == len(np.unique(all_time_indices)), \
-            'Multiple calibration integrations map to the same time index.'
+                'Multiple calibration integrations map to the same time index.'
         for cal in self.cals:
-            assert np.all(np.abs(self.cal_freqs[cal] - self.freqs) < 1e-4), \
-                '{} and {} have different frequencies.'.format(cal, self.cals[0])
+            assert np.all(
+                np.abs(self.cal_freqs[cal] - self.freqs) < 1e-4
+            ), f'{cal} and {self.cals[0]} have different frequencies.'
         if len(self.flag_files) > 0:
             all_flag_time_indices = np.array([i for indices in self.flag_time_indices.values() for i in indices])
-            assert len(all_flag_time_indices) == len(np.unique(all_flag_time_indices)), \
-                'Multiple flag file integrations map to the same time index.'
-            assert np.all(np.unique(all_flag_time_indices) == np.unique(all_time_indices)), \
-                'The number of unique indices for the flag files does not match the calibration files.'
+            unq_flag = np.unique(all_flag_time_indices)
+            unq_time = np.unique(all_time_indices)
+            assert len(unq_flag) == len(unq_time) and np.all(unq_flag == unq_time), \
+                    'The number of unique indices for the flag files does not match the calibration files.'
             for ff in self.flag_files:
                 assert np.all(np.abs(self.flag_freqs[ff] - self.freqs) < 1e-4), \
-                    '{} and {} have different frequencies.'.format(ff, self.cals[0])
+                        '{} and {} have different frequencies.'.format(ff, self.cals[0])
 
-    def rephase_to_refant(self, warn=True):
+    def rephase_to_refant(self, warn=True, propagate_refant_flags=False):
         '''If the CalibrationSmoother object has a refant attribute, this function rephases the
         filtered gains to it.'''
         if hasattr(self, 'refant'):
-            rephase_to_refant(self.gain_grids, self.refant, flags=self.flag_grids)
+            rephase_to_refant(self.gain_grids, self.refant, flags=self.flag_grids, propagate_refant_flags=propagate_refant_flags)
         elif warn:
             warnings.warn('No rephasing done because self.refant has not been set.', RuntimeWarning)
 
@@ -882,9 +980,9 @@ class CalibrationSmoother():
                         self.flag_grids[ant][:, i] = np.ones_like(self.flag_grids[ant][:, i])
         self.rephase_to_refant(warn=False)
 
-    def time_freq_2D_filter(self, freq_scale=10.0, time_scale=1800.0, tol=1e-09, filter_mode='rect',
-                            window='tukey', maxiter=100, method="CLEAN", eigenval_cutoff=1e-9, skip_flagged_edges=True,
-                            **win_kwargs):
+    def time_freq_2D_filter(self, freq_scale=10.0, time_scale=1800.0, tol=1e-09, filter_mode='rect', window='tukey',
+                            maxiter=100, method="CLEAN", fit_method='pinv', eigenval_cutoff=1e-9, skip_flagged_edges=True,
+                            fix_phase_flips=False, flag_phase_flip_ints=False, flag_phase_flip_ants=False, **win_kwargs):
         '''2D time and frequency filter stored calibration solutions on a given scale in seconds and MHz respectively.
 
         Arguments:
@@ -906,8 +1004,18 @@ class CalibrationSmoother():
             method: Algorithm used to smooth calibration solutions. Either 'CLEAN' or 'DPSS':
                 'CLEAN': uses the CLEAN algorithm to
                 'DPSS': uses discrete prolate spheroidal sequences to filter calibration solutions
+            fit_method: Linear least-squares method used to fit the DPSS model to the data.
+                Either 'pinv', 'lstsq', 'solve', or 'lu_solve'. Only used when the method is 'DPSS'
+                'lu_solve' is the fastest. 'pinv' tends to be more stable.
             skip_flagged_edges : if True, do not filter over flagged edge times (filter over sub-region)
                 Default is True, only used when method='DPSS'
+            fix_phase_flips: Optional bool. If True, will try to find integrations whose phases appear to be 180 degrees
+                rotated from the first unflagged  integration. These will be flipped before smoothing and then flipped back
+                after smoothing. Will also print info about phase-flips found. Default is False.
+            flag_phase_flip_ints: Optional bool. If True and fix_phase_flips is also True, will flag antennas on the integrations
+                just before and just after a phase flip, since the phase flip could have occured mid-integration. Default is False.
+            flag_phase_flip_ants: Optional bool. If True and fix_phase_flips is also True, will flag antennas that have a phase flip
+                for ALL integrations. Default is False.
             win_kwargs : any keyword arguments for the window function selection in aipy.dsp.gen_window.
                 Currently, the only window that takes a kwarg is the tukey window with a alpha=0.5 default
         '''
@@ -916,20 +1024,26 @@ class CalibrationSmoother():
             edges_old = None
 
         # Create default variables to be passed in to time_freq_2D_filter
-        info = {'dpss_vectors': None, 'XTXinv': None}
+        info = {'dpss_vectors': None, 'cached_input': None}
         dpss_vectors = None
-        XTXinv = None
+        cached_input = {}
         wgts_old = np.zeros(1)
 
+        # Sort antennas by number of flagged times/freqs to increase chances of reusing cached input
+        idx = np.argsort([self.flag_grids[ant].sum() for ant in self.gain_grids])
+        ant_keys = [ant for ant in self.gain_grids]
+        ordered_ant_keys = [ant_keys[i] for i in idx]
+
         # loop over all antennas that are not completely flagged and filter
-        for ant, gain_grid in self.gain_grids.items():
+        for ant in ordered_ant_keys:
+            gain_grid = self.gain_grids[ant]
             if not np.all(self.flag_grids[ant]):
                 utils.echo('    Now filtering antenna ' + str(ant[0]) + ' ' + str(ant[1]) + ' in time and frequency...', verbose=self.verbose)
                 wgts_grid = _build_wgts_grid(self.flag_grids[ant], self.time_blacklist, self.freq_blacklist, self.blacklist_wgt)
 
                 # If the weights grid is the same as the previous, the solution matrix can be reused to speed up computation
                 if method == 'DPSS' or method == 'dpss_leastsq':
-                    XTXinv = info['XTXinv'] if np.allclose(wgts_grid, wgts_old) else None
+                    cached_input = info['cached_input'] if np.allclose(wgts_grid, wgts_old) else {}
                     wgts_old = np.copy(wgts_grid)
 
                     # Check to see if the grid size changes after removing the flagged edges
@@ -940,8 +1054,24 @@ class CalibrationSmoother():
                         edges_old = deepcopy(edges)
                 filtered, info = time_freq_2D_filter(gain_grid, wgts_grid, self.freqs, self.time_grid, freq_scale=freq_scale,
                                                      time_scale=time_scale, tol=tol, filter_mode=filter_mode, maxiter=maxiter,
-                                                     window=window, dpss_vectors=dpss_vectors, method=method, XTXinv=XTXinv,
-                                                     skip_flagged_edges=skip_flagged_edges, **win_kwargs)
+                                                     window=window, dpss_vectors=dpss_vectors, eigenval_cutoff=eigenval_cutoff,
+                                                     method=method, fit_method=fit_method, cached_input=cached_input,
+                                                     skip_flagged_edges=skip_flagged_edges, fix_phase_flips=fix_phase_flips, **win_kwargs)
+                flipped = (info['phase_flips'] == -1)
+                if np.any(flipped):
+                    print(f'{np.sum(flipped)} phase-flipped integrations detected on antenna {ant} between {self.time_grid[flipped][0]} and {self.time_grid[flipped][-1]}.')
+                    if flag_phase_flip_ants:
+                        self.flag_grids[ant][:, :] = True
+                    # apply flags before and after phase flips
+                    elif flag_phase_flip_ints:
+                        most_recent_unflagged_tind = 0
+                        for tind, flipped_here in enumerate(info['phase_flips'] == -1):
+                            if not np.all(self.flag_grids[ant][tind, :]):
+                                # if the flip state has changed since the most recent unflagged integration
+                                if (info['phase_flips'][most_recent_unflagged_tind] == -1) != flipped_here:
+                                    self.flag_grids[ant][most_recent_unflagged_tind, :] = True
+                                    self.flag_grids[ant][tind, :] = True
+                                most_recent_unflagged_tind = tind
 
                 self.gain_grids[ant] = filtered
 
@@ -1042,9 +1172,11 @@ def smooth_cal_argparser():
                           discrete prolate spheroidal sequences to smooth calibration solutions.')
     flt_opts.add_argument("--eigenval_cutoff", type=str, default=1e-9, help="sinc_matrix eigenvalue cutoff to use for included dpss modes. \
                           Only used when the filtering method is 'DPSS'")
+    flt_opts.add_argument("--fit_method", type=str, default="pinv", help="Linear least-squares method used for fitting 2D DPSS modes. \
+                          Only used when the filtering method is 'DPSS'")
     flt_opts.add_argument("--dont_skip_flagged_edges", action="store_true", default=False, help="if True, use DPSS over integrations with flagged edge channels.\
                           Only used when method used is 'DPSS'")
-    flt_opts.add_argument("--axis", default="both", type=str, help="smooth either in 'freq', or 'both' (time and freq) axes.")
+    flt_opts.add_argument("--axis", default="both", type=str, help="smooth either in 'freq', 'both' (time and freq) axes or 'none' (no smoothing, just picking a refant and writing output).")
     flt_opts.add_argument("--skip_wgt", default=0.1, type=float, help="skip if this fraction is flagged.")
-    args = a.parse_args()
-    return args
+
+    return a

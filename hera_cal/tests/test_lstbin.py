@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # Copyright 2019 the HERA Project
 # Licensed under the MIT License
-
 import pytest
 import os
 import numpy as np
@@ -14,14 +13,12 @@ from .. import io, lstbin, utils, redcal
 from ..datacontainer import DataContainer
 from ..data import DATA_PATH
 import shutil
-
-
 @pytest.mark.filterwarnings("ignore:The default for the `center` keyword has changed")
 @pytest.mark.filterwarnings("ignore:Degrees of freedom <= 0 for slice")
 @pytest.mark.filterwarnings("ignore:Mean of empty slice")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in true_divide")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in greater")
-class Test_lstbin(object):
+class Test_lstbin:
     def setup_method(self):
         # load data
         np.random.seed(0)
@@ -41,8 +38,6 @@ class Test_lstbin(object):
         self.ap2, self.freqs2, self.lsts2 = list(hd2.pols.values())[0], list(hd2.freqs.values())[0], np.hstack(list(hd2.lsts.values()))
         self.data3, self.flgs3, self.nsmps3 = hd3.read()
         self.ap3, self.freqs3, self.lsts3 = list(hd3.pols.values())[0], list(hd3.freqs.values())[0], np.hstack(list(hd3.lsts.values()))
-        ap, a = hd3.get_ENU_antpos(center=True, pick_data_ants=True)
-        t = np.hstack(list(hd3.times.values()))
 
         hd1 = io.HERAData(self.data_files[0])
         hd2 = io.HERAData(self.data_files[1])
@@ -53,22 +48,22 @@ class Test_lstbin(object):
         self.ap2, self.freqs2, self.lsts2 = list(hd2.pols.values())[0], list(hd2.freqs.values())[0], np.hstack(list(hd2.lsts.values()))
         self.data3, self.flgs3, self.nsmps3 = hd3.read()
         self.ap3, self.freqs3, self.lsts3 = list(hd3.pols.values())[0], list(hd3.freqs.values())[0], np.hstack(list(hd3.lsts.values()))
-        ap, a = hd3.get_ENU_antpos(center=True, pick_data_ants=True)
-        t = np.hstack(list(hd3.times.values()))
 
         self.data_list = [self.data1, self.data2, self.data3]
         self.flgs_list = [self.flgs1, self.flgs2, self.flgs3]
         self.lst_list = [self.lsts1, self.lsts2, self.lsts3]
         self.nsmp_list = [self.nsmps1, self.nsmps2, self.nsmps3]
+        self.file_ext = "{pol}.{type}.{time:7.5f}.uvh5"
+        self.fname_format = "zen.{pol}.{kind}.{lst:7.5f}.uvh5"
 
     def test_make_lst_grid(self):
-        lst_grid = lstbin.make_lst_grid(0.01, begin_lst=None, verbose=False)
+        lst_grid = lstbin.make_lst_grid(0.01, begin_lst=None)
         assert len(lst_grid) == 628
         assert np.isclose(lst_grid[0], 0.0050025360725952121)
-        lst_grid = lstbin.make_lst_grid(0.01, begin_lst=np.pi, verbose=False)
+        lst_grid = lstbin.make_lst_grid(0.01, begin_lst=np.pi)
         assert len(lst_grid) == 628
         assert np.isclose(lst_grid[0], 3.1365901175171982)
-        lst_grid = lstbin.make_lst_grid(0.01, begin_lst=-np.pi, verbose=False)
+        lst_grid = lstbin.make_lst_grid(0.01, begin_lst=-np.pi)
         assert len(lst_grid) == 628
         assert np.isclose(lst_grid[0], 3.1365901175171982)
 
@@ -80,7 +75,7 @@ class Test_lstbin(object):
             lst_grid, dlst, file_lsts, begin_lst, lst_arrays, time_arrays = lstbin.config_lst_bin_files(data_files, ntimes_per_file=60)
             np.testing.assert_allclose(dlst, 0.0007830490163485138)
             # test that lst_grid is reasonable
-            assert np.median(np.diff(lst_grid)) == dlst
+            assert np.isclose(np.median(np.diff(lst_grid)), dlst)
             for fla in file_lsts:
                 for fl in fla:
                     assert fl in lst_grid
@@ -129,7 +124,7 @@ class Test_lstbin(object):
         assert len(output[2][list(output[2].keys())[0]][100]) == 3
         assert len(output[2][list(output[2].keys())[0]][100][0]) == 64
         # test switch bl
-        conj_data3 = DataContainer(odict(list(map(lambda k: (utils.reverse_bl(k), np.conj(self.data3[k])), self.data3.keys()))))
+        conj_data3 = DataContainer(odict([(utils.reverse_bl(k), np.conj(self.data3[k])) for k in self.data3.keys()]))
         data_list = [self.data1, self.data2, conj_data3]
         output = lstbin.lst_bin(data_list, self.lst_list, dlst=dlst)
         assert output[1][(24, 25, 'ee')].shape == (224, 64)
@@ -139,7 +134,7 @@ class Test_lstbin(object):
         output = lstbin.lst_bin(self.data_list, self.lst_list, flags_list=None, dlst=0.01,
                                 verbose=False, sig_clip=True, min_N=15, flag_below_min_N=True, sigma=2)
         # test wrapping
-        lst_list = list(map(lambda l: (copy.deepcopy(l) + 6) % (2 * np.pi), self.lst_list))
+        lst_list = [(copy.deepcopy(l) + 6) % (2 * np.pi) for l in self.lst_list]
         output = lstbin.lst_bin(self.data_list, lst_list, dlst=0.001, begin_lst=np.pi)
         assert output[0][0] > output[0][-1]
         assert len(output[0]) == 175
@@ -218,6 +213,7 @@ class Test_lstbin(object):
         assert os.path.exists(output_std_file)
         uv1 = UVData()
         uv1.read(output_lst_file)
+        uv1.use_future_array_shapes()
         # assert nsample w.r.t time follows 1-2-3-2-1 pattern
         nsamps = np.mean(uv1.get_nsamples(52, 52, 'ee'), axis=1)
         expectation = np.concatenate([np.ones(22), np.ones(22) * 2, np.ones(136) * 3, np.ones(22) * 2, np.ones(22)]).astype(float)
@@ -233,6 +229,7 @@ class Test_lstbin(object):
         assert os.path.exists(output_std_file)
         uv2 = UVData()
         uv2.read(output_lst_file)
+        uv2.use_future_array_shapes()
         assert uv1 == uv2
         os.remove(output_lst_file)
         os.remove(output_std_file)
@@ -269,6 +266,7 @@ class Test_lstbin(object):
         # load a file
         uvd1 = UVData()
         uvd1.read(output_files[1])
+        uvd1.use_future_array_shapes()
         assert uvd1.vis_units == 'Jy'
         assert 'Thisfilewasproducedbythefunction' in uvd1.history.replace('\n', '').replace(' ', '')
         assert uvd1.Ntimes == 80
@@ -285,6 +283,7 @@ class Test_lstbin(object):
         # load a file
         uvd2 = UVData()
         uvd2.read(output_files[0])
+        uvd2.use_future_array_shapes()
         # assert equivalence with previous run
         assert uvd1 == uvd2
         # remove files
@@ -319,6 +318,7 @@ class Test_lstbin(object):
         # test input_cal
         uvc = UVCal()
         uvc.read_calfits(os.path.join(DATA_PATH, 'zen.2458043.12552.xx.HH.uvORA.abs.calfits'))
+        uvc.use_future_array_shapes()
         uvc.flag_array[uvc.ant_array.tolist().index(24)] = True
         uvc.gain_array[uvc.ant_array.tolist().index(25)] = 1e10
         input_cals = []
@@ -347,6 +347,7 @@ class Test_lstbin(object):
         # assert gains and flags were propagated
         lstb = UVData()
         lstb.read(output_lst_file)
+        lstb.use_future_array_shapes()
         assert np.allclose(np.abs(lstb.get_data(25, 37)[~lstb.get_flags(25, 37)]), 0.0)
         assert np.all(lstb.get_flags(24, 25))
         # make sure a is in the data when we dont use the flag yaml.
@@ -358,13 +359,14 @@ class Test_lstbin(object):
                              ex_ant_yaml_files=self.ant_yamls)
         lstb = UVData()
         lstb.read(output_lst_file)
+        lstb.use_future_array_shapes()
         for a in [24, 25, 37, 38]:
             assert a not in np.unique(np.hstack([lstb.ant_1_array, lstb.ant_2_array]))
 
         os.remove(output_lst_file)
         os.remove(output_std_file)
 
-    def test_lstbin_filess_inhomogenous_baselines(self, tmpdir):
+    def test_lstbin_files_inhomogenous_baselines(self, tmpdir):
         tmp_path = tmpdir.strpath
         # now do a test with a more complicated set of files with inhomogenous baselines.
         # between different nights.
@@ -379,16 +381,19 @@ class Test_lstbin(object):
         for dlist in data_lists:
             hd = UVData()
             hd.read(dlist[-1])
+            hd.use_future_array_shapes()
             for bl in hd.get_antpairs():
                 bl_union.add(bl)
         output_files = sorted(glob.glob(tmp_path + '/lstbin_output/*LST*.uvh5'))
         lstb = UVData()
         lstb.read(output_files[0])
+        lstb.use_future_array_shapes()
         a1arr = lstb.ant_1_array[::lstb.Ntimes]
         a2arr = lstb.ant_2_array[::lstb.Ntimes]
         for of in output_files[1:]:
             lstb = UVData()
             lstb.read(of)
+            lstb.use_future_array_shapes()
             assert np.all(lstb.ant_1_array[::lstb.Ntimes] == a1arr)
             assert np.all(lstb.ant_2_array[::lstb.Ntimes] == a2arr)
             aps = set(lstb.get_antpairs())
@@ -407,6 +412,7 @@ class Test_lstbin(object):
         for dlist in data_lists:
             hd = UVData()
             hd.read(dlist[-1])
+            hd.use_future_array_shapes()
             for bl in hd.get_antpairs():
                 bl_union.add(bl)
         output_files = sorted(glob.glob(tmp_path + '/lstbin_output/*LST*.uvh5'))
@@ -417,6 +423,7 @@ class Test_lstbin(object):
         for of in output_files[1:]:
             lstb = UVData()
             lstb.read(of)
+            lstb.use_future_array_shapes()
             # check that all outputs have same baselines
             assert np.all(lstb.ant_1_array[::lstb.Ntimes] == a1arr)
             assert np.all(lstb.ant_2_array[::lstb.Ntimes] == a2arr)
@@ -436,11 +443,13 @@ class Test_lstbin(object):
         output_files = sorted(glob.glob(tmp_path + '/lstbin_output/*LST*.uvh5'))
         lstb = UVData()
         lstb.read(output_files[0])
+        lstb.use_future_array_shapes()
         a1arr = lstb.ant_1_array[::lstb.Ntimes]
         a2arr = lstb.ant_2_array[::lstb.Ntimes]
         for of in output_files[1:]:
             lstb = UVData()
             lstb.read(of)
+            lstb.use_future_array_shapes()
             assert np.all(lstb.ant_1_array[::lstb.Ntimes] == a1arr)
             assert np.all(lstb.ant_2_array[::lstb.Ntimes] == a2arr)
 
@@ -549,6 +558,7 @@ class Test_lstbin(object):
             for fstr in flist:
                 hd = UVData()
                 hd.read(fstr)
+                hd.use_future_array_shapes()
                 nants = len(hd.antenna_numbers)
                 # on first night, remove all but two antennas.
                 if fnum < 2:
@@ -589,7 +599,7 @@ class Test_lstbin(object):
         assert np.all(arr[10])
         assert np.all(arr[11])
         # test array performance
-        x = np.array(list(map(lambda s: stats.norm.rvs(0, s, 100), np.arange(1, 5.1, 1))))
+        x = np.array([stats.norm.rvs(0, s, 100) for s in np.arange(1, 5.1, 1)])
         x[0, 50] = 100
         x[4, 50] = 5
         arr = lstbin.sigma_clip(x, sigma=2.0)

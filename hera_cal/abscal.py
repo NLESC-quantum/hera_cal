@@ -29,11 +29,15 @@ import argparse
 import numpy as np
 import operator
 from functools import reduce
-from scipy import signal, interpolate, spatial
+from scipy import signal, interpolate, spatial, constants, fft
 from scipy.optimize import brute, minimize
 from pyuvdata import UVCal, UVData
 import linsolve
 import warnings
+
+import jax
+from jax import numpy as jnp
+jax.config.update("jax_enable_x64", True)
 
 from .apply_cal import calibrate_in_place
 from .smooth_cal import pick_reference_antenna, rephase_to_refant
@@ -554,12 +558,12 @@ def phs_logcal(model, data, wgts=None, refant=None, verbose=True):
     ls_wgts = odict([(eqns[k], wgts[k]) for i, k in enumerate(keys)])
 
     # get unique gain polarizations
-    gain_pols = np.unique(list(map(lambda k: list(split_pol(k[2])), keys)))
+    gain_pols = np.unique([split_pol(k[2]) for k in keys])
 
     # set reference antenna phase to zero
     if refant is None:
         refant = keys[0][0]
-    assert np.array(list(map(lambda k: refant in k, keys))).any(), "refant {} not found in data and model".format(refant)
+    assert any(refant in k for k in keys), f"refant {refant} not found in data and model"
 
     for p in gain_pols:
         ls_data['phi_{}_{}'.format(refant, p)] = np.zeros_like(list(ydata.values())[0])
@@ -688,12 +692,12 @@ def delay_lincal(model, data, wgts=None, refant=None, df=9.765625e4, f0=0., solv
     ls_wgts = odict([(eqns[k], ywgts[k]) for i, k in enumerate(keys)])
 
     # get unique gain polarizations
-    gain_pols = np.unique(list(map(lambda k: [split_pol(k[2])[0], split_pol(k[2])[1]], keys)))
+    gain_pols = np.unique([list(split_pol(k[2])[:2]) for k in keys])
 
     # set reference antenna phase to zero
     if refant is None:
         refant = keys[0][0]
-    assert np.array(list(map(lambda k: refant in k, keys))).any(), "refant {} not found in data and model".format(refant)
+    assert any(refant in k for k in keys), f"refant {refant} not found in data and model"
 
     for p in gain_pols:
         ls_data['tau_{}_{}'.format(refant, p)] = np.zeros_like(list(ydata.values())[0])
@@ -894,6 +898,82 @@ def delay_slope_lincal(model, data, antpos, wgts=None, refant=None, df=9.765625e
             freqs = f0 + np.arange(list(data.values())[0].shape[1]) * df
             gains[ant] = np.exp(2.0j * np.pi * np.outer(delays, freqs))
         return gains
+
+
+def RFI_delay_slope_cal(reds, antpos, red_data, freqs, rfi_chans, rfi_headings, rfi_wgts=None,
+                        min_tau=-500e-9, max_tau=500e-9, delta_tau=0.1e-9, return_gains=False, gain_ants=None):
+    '''Finds a per-unique baseline delay relative to a set of RFI transmitters with known frequency and heading,
+    and then fits that slope across the array for each degeneracy dimension. Namely, we fit a set of T_{pol}_{dim}
+    such that:
+
+    V_ij * e^(-2i π b_ij.rhat(ν) ν / c) = Σ_dims[T_{pol}_{dim}]
+
+    where b is the baseline vector and rhat is transmitter unit vector.
+
+    Arguments:
+        reds: list of list of baseline-pol tuples, e.g. (0, 1, 'ee'), considered redundant
+        antpos: dictionary mapping antenna index to length-3 vector of antenna position in meters in ENU coordinates
+        red_data: DataContainer with redundantly averaged visibility solutions.
+        freqs: array of frequencies in Hz with length equal to that of the second dimension of the data
+        rfi_chans: length Nrfi list of channel indices with RFI with known heading
+        rfi_headings: (3, Nrfi) numpy array of direciton unit vectors pointed toward stable transmitters.
+        rfi_wgts: length Nrfi list of linear multiplicative weights representating the relative confidence
+            in the delay expected in a particular channel
+        min_tau: Smallest delay for brute-force search in s (default -500 ns)
+        max_tau: Largest delay for brute-force search in s (default 500 ns)
+        delta_tau: Brute force delay search resolution (default 0.1 ns)
+        return_gains: Bool. If True, convert delay slope into gains. Otherwise, return delay slopes.
+        gain_ants: If return_gains is True, these are the keys. Ignored otherwise.
+
+    Returns:
+        if return_gains:
+            Returns a dictionary with gain_ants as keys mapping to complex gains, each the shape of the data.
+        else:
+            Returns a dictionary of delay slopes for each integration in the data, keyed by 'T_{pol}_{dim_index}'
+            where dimensions are computed using abstracted antenna positions with redcal.reds_to_antpos(reds).
+    '''
+    # check that reds are 1pol or 2pol
+    if redcal.parse_pol_mode(reds) not in ['1pol', '2pol']:
+        raise NotImplementedError('RFI_delay_slope_cal cannot currently handle 4pol calibration.')
+
+    # compute unique baseline vectors and idealized baseline vectors if desired
+    unique_blvecs = {red[0]: np.mean([antpos[bl[1]] - antpos[bl[0]] for bl in red], axis=0) for red in reds}
+    idealized_antpos = redcal.reds_to_antpos(reds)
+    idealized_blvecs = {red[0]: idealized_antpos[red[0][1]] - idealized_antpos[red[0][0]] for red in reds}
+
+    # brute-force find per-unique baseline delays that make the per-UBL visibilities, dotted into the rfi_phase, closest to real
+    vis = np.array([red_data[red[0]][:, rfi_chans] for red in reds])
+    vis /= np.abs(vis)
+    rfi_phs = np.array([np.exp(-2j * np.pi * np.dot(unique_blvecs[red[0]], rfi_headings) * freqs[rfi_chans] / constants.c) for red in reds])
+    dlys_to_check = np.arange(min_tau, max_tau, delta_tau)
+    dly_terms = np.exp(2j * np.pi * np.outer(freqs[rfi_chans], dlys_to_check))
+    # dimensions: i = Nubls, j = Ntimes, k = Ndlys
+    to_minimize = np.zeros(vis.shape[0:2] + (len(dlys_to_check),))
+    for ci in range(len(rfi_chans)):
+        wgt_here = (rfi_wgts[ci] if rfi_wgts is not None else 1.0)
+        to_minimize += np.abs(np.einsum('ij,i,k->ijk', vis[:, :, ci], rfi_phs[:, ci], dly_terms[ci, :]) - 1) * wgt_here
+    dly_sol_args = np.argmin(to_minimize, axis=-1)
+    delay_sols = {red[0]: dlys_to_check[dly_sol_args[i]] for i, red in enumerate(reds)}
+
+    # Use per-baseline delays to solve for the DoF, which is one phase slope per polarization per dimension of the idealized antpos
+    ls_data, ls_wgts = {}, {}
+    for red in reds:
+        eq_str = ' + '.join([f'T_{red[0][2]}_{dim} * {ibl_comp}' for dim, ibl_comp in enumerate(idealized_blvecs[red[0]])])
+        ls_data[eq_str] = delay_sols[red[0]]
+        ls_wgts[eq_str] = len(red) * np.ones_like(delay_sols[red[0]])  # weight by number of baselines in group
+    dly_slope_sol = linsolve.LinearSolver(ls_data, wgts=ls_wgts).solve()
+
+    if not return_gains:
+        return dly_slope_sol
+
+    # compute gains from DoF for antennas provided
+    gains = {}
+    for ant in gain_ants:
+        pol = join_pol(ant[1], ant[1])
+        ipos = idealized_antpos[ant[0]]
+        dlys = np.dot(ipos, [dly_slope_sol[f'T_{pol}_{dim}'] for dim in range(len(ipos))])
+        gains[ant] = np.exp(2j * np.pi * np.outer(dlys, freqs))
+    return gains
 
 
 def dft_phase_slope_solver(xs, ys, data, flags=None):
@@ -1105,7 +1185,7 @@ def global_phase_slope_logcal(model, data, antpos, reds=None, solver='linfit', w
     if refant is None:
         refant = keys[0][0]
     assert refant in antnums, "reference antenna {} not found in antenna list".format(refant)
-    antpos = odict(list(map(lambda k: (k, antpos[k] - antpos[refant]), antpos.keys())))
+    antpos = odict([(k, antpos[k] - antpos[refant]) for k in antpos.keys()])
 
     # count dimensions of antenna positions, figure out how many to solve for
     nDims = _count_nDims(antpos, assume_2D=assume_2D)
@@ -1215,6 +1295,332 @@ def global_phase_slope_logcal(model, data, antpos, reds=None, solver='linfit', w
         return gains
 
 
+@jax.jit
+def _eval_Z(x, B_vecs, Z_coefficients):
+    """
+    Evaluates the Fourier series for the function Z at a point x. The real part
+    of Z is the objective function for the abscal phase solution - the optimal
+    phase gradient solution is defined by the location of the global maximum
+    of Re[Z] (up to periodicity).
+
+    Parameters
+    ----------
+    x : np.ndarray or jnp.ndarray
+        Point in the domain of possible phase gradient solutions. Shape (n_dims,).
+    B_vecs : np.ndarray or jnp.ndarray
+        Array of baseline vectors. Shape (n_bls, n_dims).
+    Z_coefficients : np.ndarray or jnp.ndarray
+        Array of Fourier coefficients which are the products of the data and model
+        visibilities, correponding to the elements of B_vecs. Shape (n_bls,).
+
+    Returns
+    -------
+    Z : complex
+        Value of Z evaluated at the point x.
+    """
+    phase = jnp.sum(x * B_vecs, axis=1)
+    phasor = jnp.cos(phase) + 1j * jnp.sin(phase)
+    Z = jnp.sum(phasor * Z_coefficients) / jnp.sum(jnp.abs(Z_coefficients))
+    return Z
+
+
+@jax.jit
+def _grad_and_hess(x, B_vecs, Z_coefficients):
+    """
+    Evaluates the gradient vector and hessian matrix of the objective function
+    Re[Z] at the point x. Used in the `_newton_solve` implementation of Newton's method.
+
+    Parameters:
+    -----------
+    x : np.ndarray or jnp.ndarray
+        Point in the domain of possible phase gradient solutions. Shape (n_dims,).
+    B_vecs : np.ndarray or jnp.ndarray
+        Array of baseline vectors. Shape (n_bls, n_dims).
+    Z_coefficients : np.ndarray or jnp.ndarray
+        Array of Fourier coefficients defining the objective function,
+        correponding to the elements of B_vecs. Shape (n_bls,).
+
+    Returns:
+    --------
+    grad : np.ndarray or jnp.ndarray
+        Gradient vector of the objective function at x. Shape (n_dims,).
+    hess : np.ndarray or jnp.ndarray
+        Hessian matrix of the objective function at x. Shape (n_dims, n_dims).
+    """
+    x_dot_B = jnp.dot(B_vecs, x)
+    cos_xB = jnp.cos(x_dot_B)
+    sin_xB = jnp.sin(x_dot_B)
+
+    w_cos_d = Z_coefficients.real
+    w_sin_d = Z_coefficients.imag
+
+    # avoid complex data/evaluating complex exponentials with a little trigonometry
+    # w*sin(x+y) = w*cos(x)*sin(y) + w*sin(x)*cos(y)
+    w_sin_d_xB = cos_xB * w_sin_d + sin_xB * w_cos_d
+
+    # w*cos(x+y) = w*cos(x)*cos(y) - w*sin(x)*sin(y)
+    w_cos_d_xB = cos_xB * w_cos_d - sin_xB * w_sin_d
+
+    grad = -jnp.mean(w_sin_d_xB[..., None] * B_vecs, axis=0)
+    hess = -jnp.mean(B_vecs[:, None, :] * B_vecs[..., None] * w_cos_d_xB[..., None, None], axis=0)
+    return grad, hess
+
+
+@jax.jit
+def _newton_solve(x0, B_vecs, Z_coefficients, tol=1e-8, maxiter=15):
+    """
+    Problem specific implementation of Newton's method to solve for the location
+    of a local extrema of the objective function Re[Z], where Z is the function
+    defined in `_eval_Z`. For the solution of this method to correspond to the
+    desired global maximum, the initial point x0 must be sufficiently close to that
+    global maximum. In the event that x0 is not close enough to the global maximum,
+    the sequence still tends to converge quickly, but to some other local minima
+    or maxima of the function Re[Z].
+
+    Parameters:
+    -----------
+    x0: np.ndarray or jnp.ndarray
+        Initial point in the space of possible phase gradient solutions from
+        which the Newton steps will start. Must be sufficently close to the global
+        maximum for the iterates to converge to the desired abscal solution point.
+    B_vecs : np.ndarray or jnp.ndarray
+        Array of baseline vectors. Shape (n_bls, n_dims).
+    Z_coefficients : np.ndarray or jnp.ndarray
+        Array of Fourier coefficients defining the objective function,
+        correponding to the elements of B_vecs. Shape (n_bls,).
+    tol: float
+        Tolerance for the step size of an iteration. The sequence terminates
+        when the size of the next step is smaller in norm than this tolerance.
+    maxiter: int
+        Maximum number of iterations allowed before automatic termination. Generally,
+        if this limit is reached the returned solution is unlikely to be valid.
+
+    Returns:
+    --------
+    x: jnp.ndarray
+        Point in the space of possible phase gradient solutions at which the
+        Newton iterations terminated.
+    i: int
+        Number of iterations performed by the Newton solver.
+    """
+    def inner_function(args):
+        """
+        Function evaluated on each iteration of the while loop
+        """
+        x, i, step_diff = args
+        grad, hess = _grad_and_hess(x, B_vecs, Z_coefficients)
+        step = -1 * jnp.linalg.solve(hess, grad)
+        x += step
+        step_diff = jnp.sum(jnp.abs(step))
+        return x, i + 1, step_diff
+
+    def conditional_function(args):
+        """
+        Conditional function evaluated prior to each loop iteration
+        """
+        _, i, step_diff = args
+        return (step_diff > tol) & (i < maxiter)
+
+    # Run the main solver loop
+    x, i, _ = jax.lax.while_loop(conditional_function, inner_function, (x0, 0, 1.))
+    return x, i
+
+
+def _phase_gradient_solution(Z_coefficients, transformed_b_vecs, resolution_factor=2, newton_maxiter=15):
+    """
+    Finds the phase gradient vector (generalized to arbitrary dimensions to handle
+    non-classically redundant arrays) that minimizes the phase differences between
+    redundantly calibrated data and a model in a least squares sense.
+    The solution is formally defined as the point that maximizes the objective
+    function Re[Z] (defined in `_eval_Z` and [FUTURE MEMO]). This solution is
+    obtained with two steps. First, the function Z is evaluated on a grid
+    of points using an FFT. Second, the point on this grid at which Re[Z] is maximal
+    is used as a starting point from which Newton's method is used to find the exact
+    maximum of Re[Z]. The resolution of the FFT grid must be sufficiently fine to allow Newton's
+    method to converge to the correct solution. Formal conditions on this resolution
+    have not been established, but probably could be given generic properties
+    of the objective function and input baseline lengths. The default resolution_factor=2
+    has thus far been sufficient in all testing where a good solution exists at all.
+
+    Parameters:
+    -----------
+    Z_coefficients : np.ndarray or jnp.ndarray
+        Array of Fourier coefficients defining the objective function,
+        correponding to the elements of transformed_b_vecs. Shape (n_bls,).
+    transformed_b_vecs : np.ndarray or jnp.ndarray
+        Array of baseline vectors, which may be affine transformations of the physical
+        baseline vectors in such a way as to fully parameterize the phase degeneracies that
+        are unconstrained by redundant calibration. Shape (n_bls, n_dims).
+    resolution_factor : int
+        Factor by which to increase the resolution of the FFT grid. The N-D FFT scales
+        approximately as resolution_factor**n_dims, so this parameter should be as small as possible.
+    newton_maxiter : int
+        Maximum number of iterations allowed in the Newton's method solver. Typical numbers
+        of required iterations are observed so far to be 4-12 when the solution
+        is correct - usually closer to 4 than 12. Higher numbers than this
+        warrent suspicion of the validity of the returned solution.
+
+    Returns:
+    --------
+    Lambda_sol : np.ndarray or jnp.ndarray
+        Array of phase gradient vector solutions. Shape (n_times, n_freqs, n_dims).
+    Z_sol : np.ndarray or jnp.ndarray
+        Array of values of the complex objective function evaluated at the
+        solutions Lambda_sol. Shape (n_times, n_freqs).
+    newton_iterations : np.ndarray or jnp.ndarray
+        Array of number of newton's method iterations completed to obtain the
+        solutions Lambda_sol. Shape (n_times, n_freqs).
+    """
+    # Get the shape of the data and number of phase-gradient dimensions
+    Ntimes, Nfreqs, Ngroups = Z_coefficients.shape
+    Ndims = transformed_b_vecs.shape[1]
+
+    # Initialize the solution arrays
+    Lambda_sol = np.zeros((Ntimes, Nfreqs, Ndims), dtype=float)
+    Z_sol = np.zeros((Ntimes, Nfreqs), dtype=complex)
+    newton_iterations = np.zeros((Ntimes, Nfreqs), dtype=int)
+
+    # Largest integer lattice coordinate along each dimension - the fft
+    # grid needs to be twice this along each dimension
+    dim_maxes = np.array([np.max(np.abs(bk)) for bk in transformed_b_vecs.T])
+    Nk = 2 * dim_maxes + 1
+    Nk_use = resolution_factor * Nk + 1 if resolution_factor > 1 else Nk
+
+    # Initialize the grid and the corresponding frequencies
+    grid = np.zeros(tuple(Nk_use), dtype=np.complex64)
+    ft_freqs = [- 2 * np.pi * fft.fftshift(fft.fftfreq(n)) for n in Nk_use]
+
+    # Get the indices of the grid points corresponding to the transformed_b_vecs
+    grid_indices = [tuple(ii for ii in transformed_b_vecs[nn]) for nn in range(Ngroups)]
+
+    # Loop over times and frequency channels
+    for i_t in range(Ntimes):
+        for i_f in range(Nfreqs):
+
+            # Populate grid with Fourier coeffcients of the objective function
+            Z_coeffs_t_f = Z_coefficients[i_t, i_f]
+            for nn in range(Ngroups):
+                grid[grid_indices[nn]] = Z_coeffs_t_f[nn]
+
+            # Evaluate the complex objective function Z on a grid of sample points
+            grid_ft = fft.fftshift(fft.fftn(grid, workers=-1)) / Ngroups
+
+            # Find the indices of the grid point with the largest value of the sampled objective function
+            max_idx = np.unravel_index(np.argmax(np.real(grid_ft)), grid_ft.shape)
+
+            # Get the corresponding coordinates at that grid point
+            Lambda_init = np.array([ft_freqs[kk][ii] for kk, ii in enumerate(max_idx)])
+
+            # Find the local maximum near that initial point, which should also
+            # be the global maximum, in which case it is the desired phase gradient solution
+            Lambda_t_f, niter_t_f = _newton_solve(Lambda_init, transformed_b_vecs, Z_coeffs_t_f, 1e-8, maxiter=newton_maxiter)
+
+            # Store results
+            Lambda_sol[i_t, i_f] = Lambda_t_f
+            Z_sol[i_t, i_f] = _eval_Z(Lambda_t_f, transformed_b_vecs, Z_coeffs_t_f)
+            newton_iterations[i_t, i_f] = niter_t_f
+
+    return Lambda_sol, Z_sol, newton_iterations
+
+
+def _put_transformed_array_on_integer_grid(transformed_antpos, tol=1e-8, max_numerator=100):
+    """
+    Multiplies an antenna position dictionary by a rational number to make all positions integers, up to tol.
+    Searches multipliers up to max_numerator, then looks for the largest denominator to compress the array.
+    Function modifies the input dictionary in place.
+
+    Parameters:
+    -----------
+    transformed_antpos: dict
+        Dictionary of antenna positions in the transformed coordinate system.
+    tol: float
+        Tolerance for the positions to be considered integers.
+    max_numerator: int
+        Maximum numerator to search for a multiplier.
+    """
+    # Loop through dimensions of the transformed antpos
+    for dim in range(len(list(transformed_antpos.values())[0])):
+        this_dim_positions = np.array([ap[dim] for ap in transformed_antpos.values()])
+
+        # If any position not on integer grid
+        if np.max(np.abs(np.rint(this_dim_positions) - this_dim_positions)) > tol:
+
+            # Look for multipliers that put every antenna on an integer grid
+            for numerator in range(2, max_numerator + 1):
+                if np.max(np.abs(np.rint(this_dim_positions * numerator) - this_dim_positions * numerator)) < tol:
+                    break
+                assert numerator < max_numerator, 'Could not find a reasonable multiplier to put this array on an integer grid.'
+
+            # Look for divisors compress the array but keep every antenna on an integer grid
+            for denominator in range(max_numerator, 0, -1):
+                if np.max(np.abs(np.rint(this_dim_positions * numerator / denominator) - this_dim_positions * numerator / denominator)) < tol:
+                    break
+
+            # Apply ratio found
+            for ap in transformed_antpos:
+                transformed_antpos[ap][dim] *= (numerator / denominator)
+
+
+def complex_phase_abscal(data, model, reds, data_bls, model_bls):
+    """
+    Calculates gains that would absolute calibrate the phase of already redundantly-calibrated data.
+    Only operates one polarization at a time.
+
+    Parameters:
+    ----------
+    data : DataContainer or RedDataContainer
+        Dictionary-like container mapping baselines to data visibilities to abscal
+    model : DataContainer or RedDataContainer
+        Dictionary-like container mapping baselines to model visibilities
+    reds : list of lists
+        List of lists of redundant baselines tuples like (0, 1, 'ee')
+    data_bls : list of tuples
+        List of baseline tuples in data to use.
+    model_bls : list of tuples
+        List of baseline tuples in model to use. Must correspond the same physical separations as data_bls.
+
+    Returns:
+    -------
+    meta : dictionary
+        Contains keys for
+            'Lambda_sol' : phase gradient solutions,
+            'Z_sol' : value of the objective function at the solution,
+            'newton_iterations' : number of iterations completed by the Newton's method solver
+    delta_gains : dictionary
+        Dictionary mapping antenna keys like (0, 'Jee') to gains of the same shape of the data
+    """
+    # Check that baselines selected are for the same polarization
+    pols = list(set([bl[2] for bls in (data_bls, model_bls) for bl in bls]))
+    assert len(pols) == 1, 'complex_phase_abscal() can only solve for one polarization at a time.'
+
+    # Get transformed antenna positions and baselines
+    transformed_antpos = redcal.reds_to_antpos(reds)
+    _put_transformed_array_on_integer_grid(transformed_antpos)
+    transformed_b_vecs = np.rint([transformed_antpos[jj] - transformed_antpos[ii] for (ii, jj, pol) in data_bls]).astype(int)
+
+    # Get number of baselines and times/freqs
+    Ngroups = len(data_bls)
+    Ntimes, Nfreqs = data[data_bls[0]].shape
+
+    # Build up array of Fourier coefficients of the objective function
+    Z_coefficients = np.zeros((Ntimes, Nfreqs, Ngroups), dtype=complex)
+    for nn in range(Ngroups):
+
+        Vhat_n = data[data_bls[nn]]
+        Vbar_n = model[model_bls[nn]]
+
+        Z_coefficients[:, :, nn] = Vhat_n * np.conj(Vbar_n)
+
+    # Get solution for degenerate phase gradient vectors
+    Lambda_sol, Z_sol, newton_iterations = _phase_gradient_solution(Z_coefficients, transformed_b_vecs)
+
+    # turn solution into per-antenna gains
+    phase_angle = {a: np.sum(Lambda_sol * r, axis=-1) for a, r in transformed_antpos.items()}
+    delta_gains = {(a, utils.split_pol(pols[0])[0]): np.exp(1j * (angle)) for a, angle in phase_angle.items()}
+    meta = {'Lambda_sol': Lambda_sol, 'Z_sol': Z_sol, 'newton_iterations': newton_iterations}
+    return meta, delta_gains
+
+
 def merge_gains(gains, merge_shared=True):
     """
     Merge a list of gain (or flag) dictionaries.
@@ -1292,11 +1698,11 @@ def data_key_to_array_axis(data, key_index, array_index=-1, avg_dict=None):
 
     # sort keys across key_index
     key_sort = np.argsort(np.array(keys, dtype=object)[:, key_index])
-    keys = list(map(lambda i: keys[i], key_sort))
+    keys = [keys[i] for i in key_sort]
     popped_keys = np.unique(np.array(keys, dtype=object)[:, key_index])
 
     # get new keys
-    new_keys = list(map(lambda k: k[:key_index] + k[key_index + 1:], keys))
+    new_keys = [k[:key_index] + k[key_index + 1:] for k in keys]
     new_unique_keys = []
 
     # iterate over new_keys
@@ -1307,7 +1713,7 @@ def data_key_to_array_axis(data, key_index, array_index=-1, avg_dict=None):
         new_unique_keys.append(nk)
 
         # get all instances of redundant keys
-        ravel = list(map(lambda k: k == nk, new_keys))
+        ravel = [k == nk for k in new_keys]
 
         # iterate over redundant keys and consolidate into new arrays
         arr = []
@@ -1489,8 +1895,8 @@ def interp2d_vis(model, model_lsts, model_freqs, data_lsts, data_freqs, flags=No
     new_flags = odict()
 
     # get nearest neighbor points
-    freq_nn = np.array(list(map(lambda x: np.argmin(np.abs(model_freqs - x)), data_freqs)))
-    time_nn = np.array(list(map(lambda x: np.argmin(np.abs(model_lsts - x)), data_lsts)))
+    freq_nn = np.array([np.argmin(np.abs(model_freqs - x)) for x in data_freqs])
+    time_nn = np.array([np.argmin(np.abs(model_lsts - x)) for x in data_lsts])
     freq_nn, time_nn = np.meshgrid(freq_nn, time_nn)
 
     # get model indices meshgrid
@@ -1502,9 +1908,12 @@ def interp2d_vis(model, model_lsts, model_freqs, data_lsts, data_freqs, flags=No
               "This may cause weird behavior of interpolated points near flagged data.")
 
     # ensure flags are booleans
-    if flags is not None:
-        if np.issubdtype(flags[list(flags.keys())[0]].dtype, np.floating):
-            flags = DataContainer(odict(list(map(lambda k: (k, ~flags[k].astype(bool)), flags.keys()))))
+    if flags is not None and np.issubdtype(
+        flags[list(flags.keys())[0]].dtype, np.floating
+    ):
+        flags = DataContainer(
+            odict([(k, ~flags[k].astype(bool)) for k in flags.keys()])
+        )
 
     # loop over keys
     for i, k in enumerate(list(model.keys())):
@@ -1633,7 +2042,7 @@ def rephase_vis(model, model_lsts, data_lsts, bls, freqs, inplace=False, flags=N
     data_lsts[data_lsts < data_lsts[0]] += 2 * np.pi
 
     # get nearest neighbor model points
-    lst_nn = np.array(list(map(lambda x: np.argmin(np.abs(model_lsts - x)), data_lsts)))
+    lst_nn = np.array([np.argmin(np.abs(model_lsts - x)) for x in data_lsts])
 
     # get dlst array
     dlst = data_lsts - model_lsts[lst_nn]
@@ -1752,7 +2161,7 @@ class Baseline(object):
         # check same length
         if np.isclose(self.len, B2.len, atol=tol):
             # check x, y, z
-            equiv = bool(reduce(operator.mul, list(map(lambda x: np.isclose(*x, atol=tol), zip(self.bl, B2.bl)))))
+            equiv = np.all([np.isclose(*x, atol=tol) for x in zip(self.bl, B2.bl)])
             dot = np.dot(self.unit, B2.unit)
             if equiv:
                 return True
@@ -1799,17 +2208,17 @@ def match_red_baselines(model, model_antpos, data, data_antpos, tol=1.0, verbose
 
     # create baseline keys for model
     model_keys = list(model.keys())
-    model_bls = np.array(list(map(lambda k: Baseline(model_antpos[k[1]] - model_antpos[k[0]], tol=tol), model_keys)))
+    model_bls = np.array([Baseline(model_antpos[k[1]] - model_antpos[k[0]], tol=tol) for k in model_keys])
 
     # create baseline keys for data
     data_keys = list(data.keys())
-    data_bls = np.array(list(map(lambda k: Baseline(data_antpos[k[1]] - data_antpos[k[0]], tol=tol), data_keys)))
+    data_bls = np.array([Baseline(data_antpos[k[1]] - data_antpos[k[0]], tol=tol) for k in data_keys])
 
     # iterate over data baselines
     new_model = odict()
     for i, bl in enumerate(model_bls):
         # compre bl to all model_bls
-        comparison = np.array(list(map(lambda mbl: bl == mbl, data_bls)), np.str)
+        comparison = np.array(list(map(lambda mbl: bl == mbl, data_bls)), str)
 
         # get matches
         matches = np.where((comparison == 'True') | (comparison == 'conjugated'))[0]
@@ -1820,7 +2229,10 @@ def match_red_baselines(model, model_antpos, data, data_antpos, tol=1.0, verbose
             continue
         else:
             if len(matches) > 1:
-                echo("found more than 1 match in data to model {}: {}".format(model_keys[i], list(map(lambda j: data_keys[j], matches))), verbose=verbose)
+                echo(
+                    f"found more than 1 match in data to model {model_keys[i]}: {[data_keys[j] for j in matches]}",
+                    verbose=verbose
+                )
             # assign to new_data
             if comparison[matches[0]] == 'True':
                 new_model[data_keys[matches[0]]] = model[model_keys[i]]
@@ -1865,10 +2277,12 @@ def avg_data_across_red_bls(data, antpos, wgts=None, broadcast_wgts=True, tol=1.
     keys = list(data.keys())
 
     # get data, wgts and ants
-    pols = np.unique(list(map(lambda k: k[2], data.keys())))
+    pols = np.unique([k[2] for k in data.keys()])
     ants = np.unique(np.concatenate(keys))
     if wgts is None:
-        wgts = DataContainer(odict(list(map(lambda k: (k, np.ones_like(data[k]).astype(float)), data.keys()))))
+        wgts = DataContainer(
+            odict([(k, np.ones_like(data[k]).astype(float)) for k in data.keys()])
+        )
 
     # get redundant baselines if not provided
     if reds is None:
@@ -1891,14 +2305,14 @@ def avg_data_across_red_bls(data, antpos, wgts=None, broadcast_wgts=True, tol=1.
     # iterate over reds
     for i, bl_group in enumerate(stripped_reds):
         # average redundant baseline group
-        d = np.nansum(list(map(lambda k: data[k] * wgts[k], bl_group)), axis=0)
-        d /= np.nansum(list(map(lambda k: wgts[k], bl_group)), axis=0)
+        d = np.nansum([data[k] * wgts[k] for k in bl_group], axis=0)
+        d /= np.nansum([wgts[k] for k in bl_group], axis=0)
 
         # get wgts
         if broadcast_wgts:
-            w = np.array(reduce(operator.mul, list(map(lambda k: wgts[k], bl_group))), float) ** (1. / len(bl_group))
+            w = np.array(reduce(operator.mul, [wgts[k] for k in bl_group]), float) ** (1. / len(bl_group))
         else:
-            w = np.array(reduce(operator.add, list(map(lambda k: wgts[k], bl_group))), float) / len(bl_group)
+            w = np.array(reduce(operator.add, [wgts[k] for k in bl_group]), float) / len(bl_group)
 
         # iterate over bl_group
         for j, key in enumerate(sorted(bl_group)):
@@ -1957,11 +2371,11 @@ def mirror_data_to_red_bls(data, antpos, tol=2.0, weights=False):
     for i, k in enumerate(keys):
 
         # find which bl_group this key belongs to
-        match = np.array(list(map(lambda r: k in r, reds)))
-        conj_match = np.array(list(map(lambda r: reverse_bl(k) in r, reds)))
+        match = np.array([k in r for r in reds])
+        conj_match = np.array([reverse_bl(k) in r for r in reds])
 
         # if no match, just copy data over to red_data
-        if True not in match and True not in conj_match:
+        if not np.any(match) and not np.any(conj_match):
             red_data[k] = copy.copy(data[k])
 
         else:
@@ -2035,7 +2449,6 @@ def match_times(datafile, modelfiles, filetype='uvh5', atol=1e-5):
                                    & (model_ends > data_lsts[0] - atol)]
 
     return match
-
 
 def cut_bls(datacontainer, bls=None, min_bl_cut=None, max_bl_cut=None, inplace=False):
     """
@@ -2232,10 +2645,10 @@ class AbsCal(object):
         self.keys = sorted(set(model.keys()) & set(data.keys()))
         assert len(self.keys) > 0, "no shared keys exist between model and data"
         if pols is None:
-            pols = np.unique(list(map(lambda k: k[2], self.keys)))
+            pols = np.unique([k[2] for k in self.keys])
         self.pols = pols
         self.Npols = len(self.pols)
-        self.gain_pols = np.unique(list(map(lambda p: list(split_pol(p)), self.pols)))
+        self.gain_pols = np.unique([list(split_pol(p)) for p in self.pols])
         self.Ngain_pols = len(self.gain_pols)
 
         # append attributes
@@ -2262,7 +2675,7 @@ class AbsCal(object):
         self.wgts = wgts
 
         # setup ants
-        self.ants = np.unique(np.concatenate(list(map(lambda k: k[:2], self.keys))))
+        self.ants = np.unique(np.concatenate([k[:2] for k in self.keys]))
         self.Nants = len(self.ants)
         if refant is None:
             refant = self.keys[0][0]
@@ -2310,7 +2723,7 @@ class AbsCal(object):
             # center antpos about reference antenna
             self.antpos = odict([(k, antpos[k] - antpos[self.refant]) for k in self.ants])
             self.bls = odict([(x, self.antpos[x[0]] - self.antpos[x[1]]) for x in self.keys])
-            self.antpos_arr = np.array(list(map(lambda x: self.antpos[x], self.ants)))
+            self.antpos_arr = np.array([self.antpos[x] for x in self.ants])
             self.antpos_arr -= np.median(self.antpos_arr, axis=0)
 
     def amp_logcal(self, verbose=True):
@@ -2339,8 +2752,8 @@ class AbsCal(object):
         fit = amp_logcal(model, data, wgts=wgts, verbose=verbose)
 
         # form result array
-        self._ant_eta = odict(list(map(lambda k: (k, copy.copy(fit["eta_{}_{}".format(k[0], k[1])])), flatten(self._gain_keys))))
-        self._ant_eta_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._ant_eta[k], pk)), self._gain_keys)), 0, -1)
+        self._ant_eta = odict([(k, copy.copy(fit[f"eta_{k[0]}_{k[1]}"])) for k in flatten(self._gain_keys)])
+        self._ant_eta_arr = np.moveaxis([[self._ant_eta[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
     def phs_logcal(self, avg=False, verbose=True):
         """
@@ -2370,15 +2783,21 @@ class AbsCal(object):
         fit = phs_logcal(model, data, wgts=wgts, refant=self.refant, verbose=verbose)
 
         # form result array
-        self._ant_phi = odict(list(map(lambda k: (k, copy.copy(fit["phi_{}_{}".format(k[0], k[1])])), flatten(self._gain_keys))))
-        self._ant_phi_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._ant_phi[k], pk)), self._gain_keys)), 0, -1)
+        self._ant_phi = odict([(k, copy.copy(fit[f"phi_{k[0]}_{k[1]}"])) for k in flatten(self._gain_keys)])
+        self._ant_phi_arr = np.moveaxis([[self._ant_phi[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
         # take time and freq average
         if avg:
-            self._ant_phi = odict(list(map(lambda k: (k, np.ones_like(self._ant_phi[k])
-                                                      * np.angle(np.median(np.real(np.exp(1j * self._ant_phi[k])))
-                                                                 + 1j * np.median(np.imag(np.exp(1j * self._ant_phi[k]))))), flatten(self._gain_keys))))
-            self._ant_phi_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._ant_phi[k], pk)), self._gain_keys)), 0, -1)
+            self._ant_phi = odict([
+                (
+                    k,
+                    np.ones_like(self._ant_phi[k]) * np.angle(
+                        np.median(np.real(np.exp(1j * self._ant_phi[k])))
+                        + 1j * np.median(np.imag(np.exp(1j * self._ant_phi[k])))
+                    )
+                ) for k in flatten(self._gain_keys)
+            ])
+            self._ant_phi_arr = np.moveaxis([[self._ant_phi[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
     def delay_lincal(self, medfilt=True, kernel=(1, 11), verbose=True, time_avg=False, edge_cut=0):
         """
@@ -2441,11 +2860,11 @@ class AbsCal(object):
                 fit[phi_key] = np.repeat(phi_avg, Ntimes, axis=0)
 
         # form result
-        self._ant_dly = odict(list(map(lambda k: (k, copy.copy(fit["tau_{}_{}".format(k[0], k[1])])), flatten(self._gain_keys))))
-        self._ant_dly_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._ant_dly[k], pk)), self._gain_keys)), 0, -1)
+        self._ant_dly = odict([(k, copy.copy(fit[f"tau_{k[0]}_{k[1]}"])) for k in flatten(self._gain_keys)])
+        self._ant_dly_arr = np.moveaxis([[self._ant_dly[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
-        self._ant_dly_phi = odict(list(map(lambda k: (k, copy.copy(fit["phi_{}_{}".format(k[0], k[1])])), flatten(self._gain_keys))))
-        self._ant_dly_phi_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._ant_dly_phi[k], pk)), self._gain_keys)), 0, -1)
+        self._ant_dly_phi = odict([(k, copy.copy(fit[f"phi_{k[0]}_{k[1]}"])) for k in flatten(self._gain_keys)])
+        self._ant_dly_phi_arr = np.moveaxis([[self._ant_dly_phi[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
     def delay_slope_lincal(self, medfilt=True, kernel=(1, 15), verbose=True, time_avg=False,
                            four_pol=False, edge_cut=0):
@@ -2502,8 +2921,8 @@ class AbsCal(object):
                 fit.pop('T_ns')
 
         # form result
-        self._dly_slope = odict(list(map(lambda k: (k, copy.copy(np.array([fit["T_ew_{}".format(k[1])], fit["T_ns_{}".format(k[1])]]))), flatten(self._gain_keys))))
-        self._dly_slope_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: np.array([self._dly_slope[k][0], self._dly_slope[k][1]]), pk)), self._gain_keys)), 0, -1)
+        self._dly_slope = odict([(k, copy.copy(np.array([fit[f"T_ew_{k[1]}"], fit[f"T_ns_{k[1]}"]]))) for k in flatten(self._gain_keys)])
+        self._dly_slope_arr = np.moveaxis([[np.array([self._dly_slope[k][0], self._dly_slope[k][1]]) for k in pk] for pk in self._gain_keys], 0, -1)
 
     def global_phase_slope_logcal(self, solver='linfit', tol=1.0, edge_cut=0, verbose=True):
         """
@@ -2542,8 +2961,8 @@ class AbsCal(object):
                                         refant=self.refant, verbose=verbose, tol=tol, edge_cut=edge_cut)
 
         # form result
-        self._phs_slope = odict(list(map(lambda k: (k, copy.copy(np.array([fit["Phi_ew_{}".format(k[1])], fit["Phi_ns_{}".format(k[1])]]))), flatten(self._gain_keys))))
-        self._phs_slope_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: np.array([self._phs_slope[k][0], self._phs_slope[k][1]]), pk)), self._gain_keys)), 0, -1)
+        self._phs_slope = odict([(k, copy.copy(np.array([fit[f"Phi_ew_{k[1]}"], fit[f"Phi_ns_{k[1]}"]]))) for k in flatten(self._gain_keys)])
+        self._phs_slope_arr = np.moveaxis([[np.array([self._phs_slope[k][0], self._phs_slope[k][1]]) for k in pk] for pk in self._gain_keys], 0, -1)
 
     def abs_amp_logcal(self, verbose=True):
         """
@@ -2570,8 +2989,8 @@ class AbsCal(object):
         fit = abs_amp_logcal(model, data, wgts=wgts, verbose=verbose)
 
         # form result
-        self._abs_eta = odict(list(map(lambda k: (k, copy.copy(fit["eta_{}".format(k[1])])), flatten(self._gain_keys))))
-        self._abs_eta_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._abs_eta[k], pk)), self._gain_keys)), 0, -1)
+        self._abs_eta = odict([(k, copy.copy(fit[f"eta_{k[1]}"])) for k in flatten(self._gain_keys)])
+        self._abs_eta_arr = np.moveaxis([[self._abs_eta[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
     def TT_phs_logcal(self, verbose=True, zero_psi=True, four_pol=False):
         """
@@ -2619,11 +3038,11 @@ class AbsCal(object):
                 fit.pop('Phi_ns')
 
         # form result
-        self._abs_psi = odict(list(map(lambda k: (k, copy.copy(fit["psi_{}".format(k[1])])), flatten(self._gain_keys))))
-        self._abs_psi_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: self._abs_psi[k], pk)), self._gain_keys)), 0, -1)
+        self._abs_psi = odict([(k, copy.copy(fit[f"psi_{k[1]}"])) for k in flatten(self._gain_keys)])
+        self._abs_psi_arr = np.moveaxis([[self._abs_psi[k] for k in pk] for pk in self._gain_keys], 0, -1)
 
-        self._TT_Phi = odict(list(map(lambda k: (k, copy.copy(np.array([fit["Phi_ew_{}".format(k[1])], fit["Phi_ns_{}".format(k[1])]]))), flatten(self._gain_keys))))
-        self._TT_Phi_arr = np.moveaxis(list(map(lambda pk: list(map(lambda k: np.array([self._TT_Phi[k][0], self._TT_Phi[k][1]]), pk)), self._gain_keys)), 0, -1)
+        self._TT_Phi = odict([(k, copy.copy(np.array([fit[f"Phi_ew_{k[1]}"], fit[f"Phi_ns_{k[1]}"]]))) for k in flatten(self._gain_keys)])
+        self._TT_Phi_arr = np.moveaxis([[np.array([self._TT_Phi[k][0], self._TT_Phi[k][1]]) for k in pk] for pk in self._gain_keys], 0, -1)
 
     # amp_logcal results
     @property
@@ -2639,7 +3058,7 @@ class AbsCal(object):
         """ form complex gain from _ant_eta dict """
         if hasattr(self, '_ant_eta'):
             ant_eta = self.ant_eta
-            return odict(list(map(lambda k: (k, np.exp(ant_eta[k]).astype(complex)), flatten(self._gain_keys))))
+            return odict([(k, np.exp(ant_eta[k]).astype(complex)) for k in flatten(self._gain_keys)])
         else:
             return None
 
@@ -2668,12 +3087,16 @@ class AbsCal(object):
         else:
             return None
 
+    def _make_new_odict(self, fnc):
+        """Create new odict with keys from gain_keys, applying fnc to every key."""
+        return odict([(k, fnc(k)) for k in flatten(self._gain_keys)])
+
     @property
     def ant_phi_gain(self):
         """ form complex gain from _ant_phi dict """
         if hasattr(self, '_ant_phi'):
             ant_phi = self.ant_phi
-            return odict(list(map(lambda k: (k, np.exp(1j * ant_phi[k])), flatten(self._gain_keys))))
+            return self._make_new_odict(lambda k: np.exp(1j * ant_phi[k]))
         else:
             return None
 
@@ -2707,7 +3130,10 @@ class AbsCal(object):
         """ form complex gain from _ant_dly dict """
         if hasattr(self, '_ant_dly'):
             ant_dly = self.ant_dly
-            return odict(list(map(lambda k: (k, np.exp(2j * np.pi * self.freqs.reshape(1, -1) * ant_dly[k])), flatten(self._gain_keys))))
+            factor = 2j * np.pi * self.freqs.reshape(1, -1)
+            return self._make_new_odict(
+                lambda k: np.exp(factor * ant_dly[k])
+            )
         else:
             return None
 
@@ -2740,7 +3166,9 @@ class AbsCal(object):
         """ form complex gain from _ant_dly_phi dict """
         if hasattr(self, '_ant_dly_phi'):
             ant_dly_phi = self.ant_dly_phi
-            return odict(list(map(lambda k: (k, np.exp(1j * np.repeat(ant_dly_phi[k], self.Nfreqs, 1))), flatten(self._gain_keys))))
+            return self._make_new_odict(
+                lambda k: np.exp(1j * np.repeat(ant_dly_phi[k], self.Nfreqs, 1))
+            )
         else:
             return None
 
@@ -2777,8 +3205,12 @@ class AbsCal(object):
             dly_slope = self.dly_slope
             # turn delay slope into per-antenna complex gains, while iterating over self._gain_keys
             # einsum sums over antenna position
-            return odict(list(map(lambda k: (k, np.exp(2j * np.pi * self.freqs.reshape(1, -1) * np.einsum("i...,i->...", dly_slope[k], self.antpos[k[0]][:2]))),
-                                  flatten(self._gain_keys))))
+            factor = 2j * np.pi * self.freqs.reshape(1, -1)
+            return self._make_new_odict(
+                lambda k: np.exp(
+                    factor * np.einsum("i...,i->...", dly_slope[k], self.antpos[k[0]][:2])
+                )
+            )
         else:
             return None
 
@@ -2846,8 +3278,12 @@ class AbsCal(object):
             phs_slope = self.phs_slope
             # turn phs slope into per-antenna complex gains, while iterating over self._gain_keys
             # einsum sums over antenna position
-            return odict(list(map(lambda k: (k, np.exp(1.0j * np.ones_like(self.freqs).reshape(1, -1) * np.einsum("i...,i->...", phs_slope[k], self.antpos[k[0]][:2]))),
-                                  flatten(self._gain_keys))))
+            fac = 1.0j * np.ones_like(self.freqs).reshape(1, -1)
+            return self._make_new_odict(
+                lambda k: np.exp(
+                    fac * np.einsum("i...,i->...", phs_slope[k], self.antpos[k[0]][:2])
+                )
+            )
         else:
             return None
 
@@ -2913,7 +3349,7 @@ class AbsCal(object):
         """form complex gain from _abs_eta dict"""
         if hasattr(self, '_abs_eta'):
             abs_eta = self.abs_eta
-            return odict(list(map(lambda k: (k, np.exp(abs_eta[k]).astype(complex)), flatten(self._gain_keys))))
+            return self._make_new_odict(lambda k: np.exp(abs_eta[k]).astype(complex))
         else:
             return None
 
@@ -2967,7 +3403,7 @@ class AbsCal(object):
         """ form complex gain from _abs_psi array """
         if hasattr(self, '_abs_psi'):
             abs_psi = self.abs_psi
-            return odict(list(map(lambda k: (k, np.exp(1j * abs_psi[k])), flatten(self._gain_keys))))
+            return self._make_new_odict(lambda k: np.exp(1j * abs_psi[k]))
         else:
             return None
 
@@ -3020,7 +3456,11 @@ class AbsCal(object):
         if hasattr(self, '_TT_Phi'):
             TT_Phi = self.TT_Phi
             # einsum sums over antenna position
-            return odict(list(map(lambda k: (k, np.exp(1j * np.einsum("i...,i->...", TT_Phi[k], self.antpos[k[0]][:2]))), flatten(self._gain_keys))))
+            return self._make_new_odict(
+                lambda k: np.exp(
+                    1j * np.einsum("i...,i->...", TT_Phi[k], self.antpos[k[0]][:2])
+                )
+            )
         else:
             return None
 
@@ -3179,7 +3619,7 @@ def abscal_step(gains_to_update, AC, AC_func, AC_kwargs, gain_funcs, gain_args_l
 
 
 def match_baselines(data_bls, model_bls, data_antpos, model_antpos=None, pols=[], data_is_redsol=False,
-                    model_is_redundant=False, tol=1.0, min_bl_cut=None, max_bl_cut=None, max_dims=2, verbose=False):
+                    model_is_redundant=False, tol=1.0, min_bl_cut=None, max_bl_cut=None, max_dims=2, verbose=False, include_autos=False):
     '''Figure out which baselines to use in the data and the model for abscal and their correspondence.
 
     Arguments:
@@ -3195,6 +3635,7 @@ def match_baselines(data_bls, model_bls, data_antpos, model_antpos=None, pols=[]
             smaller than min_bl_cut. This is assumed to be in ENU coordinates with units of meters.
         max_bl_cut : float, eliminate all visibilities with baseline separation lengths
             larger than max_bl_cut. This is assumed to be in ENU coordinates with units of meters.
+        include_autos: bool, if true, include autocorr redundant group. Default is false.
 
     Returns:
         data_bl_to_load: list of baseline tuples in the form (0, 1, 'ee') to load from the data file
@@ -3225,7 +3666,7 @@ def match_baselines(data_bls, model_bls, data_antpos, model_antpos=None, pols=[]
         # increase all antenna indices in the model by model_offset to distinguish them from data antennas
         model_offset = np.max(list(data_antpos.keys())) + 1
         joint_antpos = {**data_antpos, **{ant + model_offset: pos for ant, pos in model_antpos.items()}}
-        joint_reds = redcal.get_reds(joint_antpos, pols=pols, bl_error_tol=tol)
+        joint_reds = redcal.get_reds(joint_antpos, pols=pols, bl_error_tol=tol, include_autos=include_autos)
 
         # filter out baselines not in data or model or between data and model
         joint_reds = [[bl for bl in red if not ((bl[0] < model_offset) ^ (bl[1] < model_offset))] for red in joint_reds]
@@ -3405,7 +3846,8 @@ def _get_idealized_antpos(cal_flags, antpos, pols, tol=1.0, keep_flagged_ants=Tr
 
 
 def post_redcal_abscal(model, data, data_wgts, rc_flags, edge_cut=0, tol=1.0, kernel=(1, 15),
-                       phs_max_iter=100, phs_conv_crit=1e-6, verbose=True, use_abs_amp_lincal=True):
+                       phs_max_iter=100, phs_conv_crit=1e-6, verbose=True,
+                       use_abs_amp_logcal=True, use_abs_amp_lincal=True):
     '''Performs Abscal for data that has already been redundantly calibrated.
 
     Arguments:
@@ -3422,6 +3864,7 @@ def post_redcal_abscal(model, data, data_wgts, rc_flags, edge_cut=0, tol=1.0, ke
         phs_max_iter: maximum number of iterations of phase_slope_cal or TT_phs_cal allowed
         phs_conv_crit: convergence criterion for updates to iterative phase calibration that compares
             the updates to all 1.0s.
+        use_abs_amp_logcal: start absolute amplitude calibration with a biased but robust first step. Default True.
         use_abs_amp_lincal: finish calibration with an unbiased amplitude lincal step. Default True.
 
     Returns:
@@ -3437,9 +3880,12 @@ def post_redcal_abscal(model, data, data_wgts, rc_flags, edge_cut=0, tol=1.0, ke
     reds = redcal.get_reds(idealized_antpos, pols=data.pols(), bl_error_tol=redcal.IDEALIZED_BL_TOL)
 
     # Abscal Step 1: Per-Channel Logarithmic Absolute Amplitude Calibration
-    gains_here = abs_amp_logcal(model, data, wgts=data_wgts, verbose=verbose, return_gains=True, gain_ants=ants)
-    abscal_delta_gains = {ant: gains_here[ant] for ant in ants}
-    apply_cal.calibrate_in_place(data, gains_here)
+    if use_abs_amp_logcal:
+        gains_here = abs_amp_logcal(model, data, wgts=data_wgts, verbose=verbose, return_gains=True, gain_ants=ants)
+        abscal_delta_gains = {ant: gains_here[ant] for ant in ants}
+        apply_cal.calibrate_in_place(data, gains_here)
+    else:
+        abscal_delta_gains = {ant: np.ones_like(rc_flags[ant], dtype=np.complex64) for ant in ants}
 
     # Abscal Step 2: Global Delay Slope Calibration
     binary_wgts = DataContainer({bl: (data_wgts[bl] > 0).astype(float) for bl in data_wgts})
@@ -3490,7 +3936,7 @@ def post_redcal_abscal(model, data, data_wgts, rc_flags, edge_cut=0, tol=1.0, ke
 
 def post_redcal_abscal_run(data_file, redcal_file, model_files, raw_auto_file=None, data_is_redsol=False, model_is_redundant=False, output_file=None,
                            nInt_to_load=None, data_solar_horizon=90, model_solar_horizon=90, extrap_limit=.5, min_bl_cut=1.0, max_bl_cut=None,
-                           edge_cut=0, tol=1.0, phs_max_iter=100, phs_conv_crit=1e-6, refant=None, clobber=True, add_to_history='', verbose=True,
+                           edge_cut=0, tol=1.0, phs_max_iter=100, phs_conv_crit=1e-6, refant=None, clobber=True, add_to_history='', verbose=True, skip_abs_amp_lincal=False,
                            write_delta_gains=False, output_file_delta=None):
     '''Perform abscal on entire data files, picking relevant model_files from a list and doing partial data loading.
     Does not work on data (or models) with baseline-dependant averaging.
@@ -3526,6 +3972,7 @@ def post_redcal_abscal_run(data_file, redcal_file, model_files, raw_auto_file=No
         refant: tuple of the form (0, 'Jnn') indicating the antenna defined to have 0 phase. If None, refant will be automatically chosen.
         clobber: if True, overwrites existing abscal calfits file at the output path
         add_to_history: string to add to history of output abscal file
+        skip_abs_amp_lincal: if False, finish calibration with an unbiased amplitude lincal step. Default False.
         write_delta_gains: write the degenerate gain component solved by abscal so a separate file specified by output_file_delta. Quality and flag arrays are equal to abscal file.
         output_file_delta: path to file to write delta gains if write_delta_gains=True
 
@@ -3574,8 +4021,8 @@ def post_redcal_abscal_run(data_file, redcal_file, model_files, raw_auto_file=No
             warnings.warn(f"Warning: Overwriting redcal gain_scale of {hc.gain_scale} with model gain_scale of {hdm.vis_units}", RuntimeWarning)
         hc.gain_scale = hdm.vis_units  # set vis_units of hera_cal based on model files.
         hd_autos = io.HERAData(raw_auto_file)
-        assert hdm.x_orientation == hd.x_orientation, 'Data x_orientation, {}, does not match model x_orientation, {}'.format(hd.x_orientation, hdm.x_orientation)
-        assert hc.x_orientation == hd.x_orientation, 'Data x_orientation, {}, does not match redcal x_orientation, {}'.format(hd.x_orientation, hc.x_orientation)
+        assert hdm.x_orientation.lower() == hd.x_orientation.lower(), 'Data x_orientation, {}, does not match model x_orientation, {}'.format(hd.x_orientation.lower(), hdm.x_orientation.lower())
+        assert hc.x_orientation.lower() == hd.x_orientation.lower(), 'Data x_orientation, {}, does not match redcal x_orientation, {}'.format(hd.x_orientation.lower(), hc.x_orientation.lower())
         pol_load_list = [pol for pol in hd.pols if split_pol(pol)[0] == split_pol(pol)[1]]
 
         # get model bls and antpos to use later in baseline matching
@@ -3656,7 +4103,7 @@ def post_redcal_abscal_run(data_file, redcal_file, model_files, raw_auto_file=No
 
                             # run absolute calibration to get the gain updates
                             delta_gains = post_redcal_abscal(model, data, data_wgts, rc_flags_subset, edge_cut=edge_cut, tol=tol,
-                                                             phs_max_iter=phs_max_iter, phs_conv_crit=phs_conv_crit, verbose=verbose)
+                                                             phs_max_iter=phs_max_iter, phs_conv_crit=phs_conv_crit, verbose=verbose, use_abs_amp_lincal=not(skip_abs_amp_lincal))
 
                             # abscal autos, rebuild weights, and generate abscal Chi^2
                             calibrate_in_place(autocorrs, delta_gains)
@@ -3854,7 +4301,6 @@ def run_model_based_calibration(data_file, model_file, output_filename, auto_fil
         # also make sure to only include baselines present in hdd.
         hdm.select(bls=hdd.bls)
         hdm._determine_blt_slicing()
-        hdm._determine_pol_indexing()
 
     model, model_flags, model_nsamples = hdm.build_datacontainers()
 
@@ -3874,7 +4320,8 @@ def run_model_based_calibration(data_file, model_file, output_filename, auto_fil
     hc = hc.initialize_from_uvdata(uvdata=hdd, gain_convention='divide', cal_style='sky',
                                    ref_antenna_name=refant_init, sky_catalog=f'{model_file}',
                                    metadata_only=False, sky_field=field_str, cal_type='gain',
-                                   future_array_shapes=False)
+                                   future_array_shapes=True)
+
     hc = io.to_HERACal(hc)
     hc.update(flags=data_ant_flags)
     # generate cal object from model to hold model flags.
@@ -3882,8 +4329,7 @@ def run_model_based_calibration(data_file, model_file, output_filename, auto_fil
     hcm = hcm.initialize_from_uvdata(uvdata=hdm, gain_convention='divide', cal_style='sky',
                                      ref_antenna_name=refant_init, sky_catalog=f'{model_file}',
                                      metadata_only=False, sky_field=field_str, cal_type='gain',
-                                     future_array_shapes=False)
-
+                                     future_array_shapes=True)
     hcm = io.to_HERACal(hcm)
     hcm.update(flags=model_ant_flags)
     # init all gains to unity.
@@ -3976,7 +4422,6 @@ def run_model_based_calibration(data_file, model_file, output_filename, auto_fil
 
     # update the calibration array.
     hc.update(gains=abscal_gains)
-
     hc.write(output_filename, clobber=clobber, spoof_missing_channels=spoof_missing_channels)
 
 
@@ -4004,10 +4449,10 @@ def post_redcal_abscal_argparser():
     a.add_argument("--phs_conv_crit", default=1e-6, type=float, help="convergence criterion for updates to iterative phase calibration that compares them to all 1.0s.")
     a.add_argument("--clobber", default=False, action="store_true", help="overwrites existing abscal calfits file at the output path")
     a.add_argument("--verbose", default=False, action="store_true", help="print calibration progress updates")
+    a.add_argument("--skip_abs_amp_lincal", default=False, action="store_true", help="finish calibration with an unbiased amplitude lincal step")
     a.add_argument("--write_delta_gains", default=False, action="store_true", help="Write degenerate abscal component of gains separately.")
     a.add_argument("--output_file_delta", type=str, default=None, help="Filename to write delta gains too.")
-    args = a.parse_args()
-    return args
+    return a
 
 
 def model_calibration_argparser():

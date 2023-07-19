@@ -4,6 +4,7 @@
 
 import pytest
 import os
+from scipy import constants
 import numpy as np
 import sys
 from collections import OrderedDict as odict
@@ -13,10 +14,10 @@ from pyuvdata import UVCal, UVData
 import warnings
 from hera_sim.antpos import hex_array, linear_array
 
-from .. import io, abscal, redcal, utils
+from .. import io, abscal, redcal, utils, apply_cal
 from ..data import DATA_PATH
 from ..datacontainer import DataContainer
-from ..utils import split_pol, reverse_bl
+from ..utils import split_pol, reverse_bl, split_bl
 from ..apply_cal import calibrate_in_place
 from ..flag_utils import synthesize_ant_flags
 
@@ -31,6 +32,7 @@ class Test_AbsCal_Funcs(object):
         self.data_file = os.path.join(DATA_PATH, "zen.2458043.12552.xx.HH.uvORA")
         self.uvd = UVData()
         self.uvd.read_miriad(self.data_file)
+        self.uvd.use_future_array_shapes()
         self.freq_array = np.unique(self.uvd.freq_array)
         self.antpos, self.ants = self.uvd.get_ENU_antpos(center=True, pick_data_ants=True)
         self.antpos = odict(zip(self.ants, self.antpos))
@@ -161,15 +163,15 @@ class Test_AbsCal_Funcs(object):
         i2 = keys.index(k2)
         k3 = (52, 53, 'ee')   # 14.6 m E-W
         i3 = keys.index(k3)
-        bls = list(map(lambda k: abscal.Baseline(self.antpos[k[1]] - self.antpos[k[0]], tol=2.0), keys))
-        bls_conj = list(map(lambda k: abscal.Baseline(self.antpos[k[0]] - self.antpos[k[1]], tol=2.0), keys))
+        bls = [abscal.Baseline(self.antpos[k[1]] - self.antpos[k[0]], tol=2.0) for k in keys]
+        bls_conj = [abscal.Baseline(self.antpos[k[0]] - self.antpos[k[1]], tol=2.0) for k in keys]
         assert bls[i1] == bls[i1]
         assert bls[i1] != bls[i2]
         assert (bls[i1] == bls_conj[i1]) == 'conjugated'
         # test different yet redundant baselines still agree
         assert bls[i1] == bls[i3]
         # test tolerance works as expected
-        bls = list(map(lambda k: abscal.Baseline(self.antpos[k[1]] - self.antpos[k[0]], tol=1e-4), keys))
+        bls = [abscal.Baseline(self.antpos[k[1]] - self.antpos[k[0]], tol=1e-4) for k in keys]
         assert bls[i1] != bls[i3]
 
     def test_match_red_baselines(self):
@@ -185,7 +187,7 @@ class Test_AbsCal_Funcs(object):
     def test_mirror_data_to_red_bls(self):
         # make fake data
         reds = redcal.get_reds(self.antpos, pols=['ee'])
-        data = DataContainer(odict(list(map(lambda k: (k[0], self.data[k[0]]), reds[:5]))))
+        data = DataContainer(odict([(k[0], self.data[k[0]]) for k in reds[:5]]))
         # test execuation
         d = abscal.mirror_data_to_red_bls(data, self.antpos)
         assert len(d.keys()) == 16
@@ -226,10 +228,9 @@ class Test_AbsCal_Funcs(object):
         assert len(rf.keys()) == 21
 
     def test_match_times(self):
-        dfiles = list(map(lambda f: os.path.join(DATA_PATH, f), ['zen.2458043.12552.xx.HH.uvORA',
-                                                                 'zen.2458043.13298.xx.HH.uvORA']))
-        mfiles = list(map(lambda f: os.path.join(DATA_PATH, f), ['zen.2458042.12552.xx.HH.uvXA',
-                                                                 'zen.2458042.13298.xx.HH.uvXA']))
+        dfiles = [os.path.join(DATA_PATH, f'zen.2458043.{f}.xx.HH.uvORA') for f in (12552, 13298)]
+        mfiles = [os.path.join(DATA_PATH, f'zen.2458042.{f}.xx.HH.uvXA') for f in (12552, 13298)]
+
         # test basic execution
         relevant_mfiles = abscal.match_times(dfiles[0], mfiles, filetype='miriad')
         assert len(relevant_mfiles) == 2
@@ -243,10 +244,10 @@ class Test_AbsCal_Funcs(object):
 
     def test_rephase_vis(self):
         dfile = os.path.join(DATA_PATH, 'zen.2458043.12552.xx.HH.uvORA')
-        mfiles = list(map(lambda f: os.path.join(DATA_PATH, f), ['zen.2458042.12552.xx.HH.uvXA']))
+        mfiles = [os.path.join(DATA_PATH, 'zen.2458042.12552.xx.HH.uvXA')]
         m, mf, mantp, mant, mfr, mt, ml, mp = io.load_vis(mfiles, return_meta=True)
         d, df, dantp, dant, dfr, dt, dl, dp = io.load_vis(dfile, return_meta=True)
-        bls = odict(list(map(lambda k: (k, dantp[k[0]] - dantp[k[1]]), d.keys())))
+        bls = odict([(k, dantp[k[0]] - dantp[k[1]]) for k in d.keys()])
 
         # basic execution
         new_m, new_f = abscal.rephase_vis(m, ml, dl, bls, dfr)
@@ -289,6 +290,53 @@ class Test_AbsCal_Funcs(object):
         x_slope_est, y_slope_est = abscal.dft_phase_slope_solver(xs, ys, data)
         np.testing.assert_array_almost_equal(phase_slopes_x - x_slope_est, 0, decimal=7)
         np.testing.assert_array_almost_equal(phase_slopes_y - y_slope_est, 0, decimal=7)
+
+    def test_put_transformed_array_on_integer_grid(self):
+        # Create a set of points that are not on an integer grid
+        np.random.seed(42)
+        antvec = np.random.uniform(0, 10, size=(5))
+        antpos = {i: np.array([antvec[i]]) for i in range(5)}
+
+        # Check that the function raises an error if the points are not on an integer grid
+        with pytest.raises(AssertionError):
+            abscal._put_transformed_array_on_integer_grid(antpos)
+
+        # Create a set of points that can be put on an integer grid
+        antvec = np.arange(0, 5, 0.5)
+        antpos = {i: np.array([antvec[i]]) for i in range(antvec.shape[0])}
+        abscal._put_transformed_array_on_integer_grid(antpos)
+
+        # Check that the points are now on an integer grid
+        for i in range(antvec.shape[0]):
+            assert np.isclose(antpos[i], i)
+
+    def test_grad_and_hess(self):
+        # Generate a set of baseline vectors
+        np.random.seed(42)
+        blvecs = np.column_stack([np.linspace(0, 5, 10), np.linspace(0, 2, 10)])
+        data = np.ones(10)
+        x = np.random.normal(2, 0.25, size=(2))
+        data = data * np.exp(-1j * np.dot(x, blvecs.T))
+
+        # Compute gradient and hessian
+        grad, _ = abscal._grad_and_hess(x, blvecs, data)
+
+        # At global minimum, gradient should be zero
+        assert np.allclose(grad, np.zeros(2))
+
+    def test_eval_Z(self):
+        # Generate a simple set of data
+        blvecs = np.column_stack([np.linspace(0, 5, 10), np.linspace(0, 2, 10)])
+        data = np.ones(10)
+        x = np.random.normal(2, 0.25, size=(2))
+        data = data * np.exp(-1j * np.dot(x, blvecs.T))
+
+        # Compute Z
+        Z = abscal._eval_Z(x, blvecs, data)
+
+        # At solution point Z should be 1 + 0j
+        np.testing.assert_array_almost_equal(Z.real, 1)
+        np.testing.assert_array_almost_equal(Z.imag, 0)
 
 
 @pytest.mark.filterwarnings("ignore:invalid value encountered in true_divide")
@@ -494,6 +542,52 @@ class Test_Abscal_Solvers(object):
         for ant in ants:
             np.testing.assert_array_almost_equal(rephased_gains[ant], rephased_true_gains[ant], decimal=3)
 
+    def test_RFI_delay_slope_cal(self):
+        # build array
+        antpos = hex_array(3, split_core=False, outriggers=0)
+        antpos[19] = np.array([101, 102, 0])
+        reds = redcal.get_reds(antpos, pols=['ee', 'nn'])
+        red_data = DataContainer({red[0]: np.ones((5, 128), dtype=complex) for red in reds})
+        freqs = np.linspace(50e6, 250e6, 128)
+        unique_blvecs = {red[0]: np.mean([antpos[bl[1]] - antpos[bl[0]] for bl in red], axis=0) for red in reds}
+        idealized_antpos = redcal.reds_to_antpos(reds)
+        idealized_blvecs = {red[0]: idealized_antpos[red[0][1]] - idealized_antpos[red[0][0]] for red in reds}
+
+        # Invent RFI stations and delay slopes
+        rfi_chans = [7, 9, 12, 13, 22, 31, 33]
+        rfi_angles = [0.7853981, 0.7853981, 0.7853981, 6.0632738, 6.0632738, 0.7853981, 6.0632738]
+        rfi_headings = np.array([np.cos(rfi_angles), np.sin(rfi_angles), np.zeros_like(rfi_angles)])
+        rfi_wgts = np.array([1, 2, 1, 3, 1, 5, 1])
+        true_delay_slopes = {'T_ee_0': 1e-9, 'T_ee_1': -2e-9, 'T_ee_2': 1.5e-9,
+                             'T_nn_0': 1.8e-9, 'T_nn_1': -5e-9, 'T_nn_2': 3.5e-9}
+
+        # Add RFI and uncalibrate
+        for bl in red_data:
+            for chan, heading in zip(rfi_chans, rfi_headings.T):
+                red_data[bl][:, chan] = 100 * np.exp(2j * np.pi * np.dot(unique_blvecs[bl], heading) * freqs[chan] / constants.c)
+            for key, slope in true_delay_slopes.items():
+                if key[2:4] == bl[2]:
+                    red_data[bl] *= np.exp(-2j * np.pi * idealized_blvecs[bl][int(key[-1])] * slope * freqs)
+
+        # Solve for delay slopes
+        solved_dly_slopes = abscal.RFI_delay_slope_cal(reds, antpos, red_data, freqs, rfi_chans, rfi_headings, rfi_wgts=rfi_wgts)
+        for key, slope in solved_dly_slopes.items():
+            assert np.all(np.abs((slope - true_delay_slopes[key]) / true_delay_slopes[key]) < 1e-10)
+
+        # test converting slopes to gains
+        ants_in_reds = set([ant for red in reds for bl in red for ant in split_bl(bl)])
+        gains = abscal.RFI_delay_slope_cal(reds, antpos, red_data, freqs, rfi_chans, rfi_headings, rfi_wgts=rfi_wgts,
+                                           return_gains=True, gain_ants=ants_in_reds)
+        # test showing that non-RFI contaminated channels have been returned to 1s
+        calibrate_in_place(red_data, gains)
+        not_rfi_chans = [i for i in range(128) if i not in rfi_chans]
+        for bl in red_data:
+            np.testing.assert_almost_equal(red_data[bl][:, not_rfi_chans], 1.0, decimal=10)
+
+        with pytest.raises(NotImplementedError):
+            reds = redcal.get_reds(antpos, pols=['ee', 'nn', 'en', 'ne'])
+            solved_dly_slopes = abscal.RFI_delay_slope_cal(reds, antpos, red_data, freqs, rfi_chans, rfi_headings, rfi_wgts=rfi_wgts)
+
     def test_ndim_fft_phase_slope_solver_1D_ideal_antpos(self):
         antpos = linear_array(50)
         reds = redcal.get_reds(antpos, pols=['ee'], pol_mode='1pol')
@@ -614,6 +708,49 @@ class Test_Abscal_Solvers(object):
             calibrate_in_place(data, gains)
         np.testing.assert_array_almost_equal(np.linalg.norm([data[bl] - model[bl] for bl in data]), 0, 5)
 
+    def test_complex_phase_abscal(self):
+        # with split_core=True this array will have 4 degenerate phase parameters to solve for
+        antpos = hex_array(3, split_core=True, outriggers=0)
+        reds = redcal.get_reds(antpos)
+        transformed_antpos = redcal.reds_to_antpos(reds)
+        abscal._put_transformed_array_on_integer_grid(transformed_antpos)
+
+        data_bls = model_bls = [group[0] for group in reds]
+        transformed_b_vecs = np.rint([transformed_antpos[jj] - transformed_antpos[ii] for (ii, jj, pol) in data_bls]).astype(int)
+
+        model, data = {}, {}
+        ntimes, nfreqs = 1, 2
+
+        # Test that the data is calibrated properly after being moved in phase
+        phase_deg = np.random.normal(0, 1, (ntimes, nfreqs, transformed_b_vecs.shape[-1]))
+        for bi, bls in enumerate(data_bls):
+            model[bls] = np.ones((ntimes, nfreqs))
+            data[bls] = model[bls] * np.exp(-1j * np.sum(transformed_b_vecs[bi][None, None, :] * phase_deg, axis=-1))
+
+        # Solve for the phase degeneracy
+        meta, delta_gains = abscal.complex_phase_abscal(data, model, reds, data_bls, model_bls)
+
+        # Apply calibration with new gains
+        apply_cal.calibrate_in_place(data, delta_gains)
+
+        # Test that the data is calibrated properly after being moved in phase
+        for k in data:
+            np.testing.assert_array_almost_equal(data[k], model[k])
+
+        # Test that function errors when polarizations are not the same
+        model, data = {}, {}
+        model_bls = [group[0] for group in reds]
+        data_bls = [group[0][:2] + ('ee', ) for group in reds]
+
+        # Test that the data is calibrated properly after being moved in phase
+        phase_deg = np.random.normal(0, 1, (ntimes, nfreqs, transformed_b_vecs.shape[-1]))
+        for bi, bls in enumerate(data_bls):
+            model[bls] = np.ones((ntimes, nfreqs))
+            data[bls[:2] + ('ee',)] = model[bls]
+
+        with pytest.raises(AssertionError):
+            meta, delta_gains = abscal.complex_phase_abscal(data, model, reds, data_bls, model_bls)
+
 
 @pytest.mark.filterwarnings("ignore:The default for the `center` keyword has changed")
 @pytest.mark.filterwarnings("ignore:invalid value encountered in true_divide")
@@ -632,9 +769,9 @@ class Test_AbsCal(object):
         d, fl, ap, a, f, t, l, p = io.load_vis(self.data_fname, return_meta=True, pick_data_ants=False)
         self.freq_array = f
         self.antpos = ap
-        gain_pols = np.unique(list(map(split_pol, p)))
+        gain_pols = np.unique([split_pol(pp) for pp in p])
         self.ap = ap
-        self.gk = abscal.flatten(list(map(lambda p: list(map(lambda k: (k, p), a)), gain_pols)))
+        self.gk = abscal.flatten([[(k, p) for k in a] for p in gain_pols])
         self.freqs = f
 
     def test_init(self):
@@ -653,7 +790,7 @@ class Test_AbsCal(object):
         assert AC.refant == 24
         assert np.allclose(np.linalg.norm(AC.antpos[24]), 0.0)
         # test bl cut
-        assert not np.any(np.array(list(map(lambda k: np.linalg.norm(AC.bls[k]), AC.bls.keys()))) > 26.0)
+        assert not np.any(np.array([np.linalg.norm(AC.bls[k]) for k in AC.bls.keys()]) > 26.0)
         # test bl taper
         assert np.median(AC.wgts[(24, 25, 'ee')]) > np.median(AC.wgts[(24, 39, 'ee')])
 
@@ -1033,7 +1170,9 @@ class Test_AbsCal(object):
         hd = UVData()
         hdm = UVData()
         hd.read(data_fname)
+        hd.use_future_array_shapes()
         hdm.read(model_fname)
+        hdm.use_future_array_shapes()
         # test feeding UVData objects instead.
         abscal.run_model_based_calibration(data_file=hd, model_file=hdm, auto_file=hd,
                                            output_filename=cal_fname, clobber=True, refant=(0, 'Jnn'), precalibration_gain_file=precal_fname)
@@ -1548,6 +1687,14 @@ class Test_Post_Redcal_Abscal_Run(object):
             assert delta_gains[k].shape == (3, rc_gains[k].shape[1])
             assert delta_gains[k].dtype == complex
 
+        # try running without amplitude solvers
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            delta_gains = abscal.post_redcal_abscal(model, copy.deepcopy(data), wgts, rc_flags_subset, verbose=False,
+                                                    use_abs_amp_logcal=False, use_abs_amp_lincal=False)
+        for k in delta_gains:
+            np.testing.assert_array_almost_equal(np.abs(delta_gains[k]), 1)
+
     def test_post_redcal_abscal_run_units_warning(self, tmpdir):
         tmp_path = tmpdir.strpath
         calfile_units = os.path.join(tmp_path, 'redcal_units.calfits')
@@ -1735,7 +1882,7 @@ class Test_Post_Redcal_Abscal_Run(object):
 
     def test_post_redcal_abscal_argparser(self):
         sys.argv = [sys.argv[0], 'a', 'b', 'c', 'd', '--nInt_to_load', '6', '--verbose']
-        a = abscal.post_redcal_abscal_argparser()
+        a = abscal.post_redcal_abscal_argparser().parse_args()
         assert a.data_file == 'a'
         assert a.redcal_file == 'b'
         assert a.model_files[0] == 'c'

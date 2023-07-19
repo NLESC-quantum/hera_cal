@@ -16,6 +16,9 @@ from pyuvdata import UVCal, UVData, UVFlag
 from pyuvdata.utils import parse_polstr, parse_jpolstr
 import glob
 import sys
+from .mock_uvdata import create_mock_hera_obs
+from tempfile import TemporaryDirectory
+from pyuvdata.uvdata import FastUVH5Meta
 
 from .. import io
 from ..io import HERACal, HERAData
@@ -53,10 +56,11 @@ class Test_HERACal(object):
         gains, flags, quals, total_qual = hc.read()
         uvc = UVCal()
         uvc.read_calfits(self.fname)
-        np.testing.assert_array_equal(uvc.gain_array[0, 0, :, :, 0].T, gains[9, parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
-        np.testing.assert_array_equal(uvc.flag_array[0, 0, :, :, 0].T, flags[9, parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
-        np.testing.assert_array_equal(uvc.quality_array[0, 0, :, :, 0].T, quals[9, parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
-        np.testing.assert_array_equal(uvc.total_quality_array[0, :, :, 0].T, total_qual[parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
+        uvc.use_future_array_shapes()
+        np.testing.assert_array_equal(uvc.gain_array[0, :, :, 0].T, gains[9, parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
+        np.testing.assert_array_equal(uvc.flag_array[0, :, :, 0].T, flags[9, parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
+        np.testing.assert_array_equal(uvc.quality_array[0, :, :, 0].T, quals[9, parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
+        np.testing.assert_array_equal(uvc.total_quality_array[:, :, 0].T, total_qual[parse_jpolstr('jxx', x_orientation=hc.x_orientation)])
         np.testing.assert_array_equal(np.unique(uvc.freq_array), hc.freqs)
         np.testing.assert_array_equal(np.unique(uvc.time_array), hc.times)
         assert hc.pols == [parse_jpolstr('jxx', x_orientation=hc.x_orientation), parse_jpolstr('jyy', x_orientation=hc.x_orientation)]
@@ -103,6 +107,54 @@ class Test_HERACal(object):
         g2, _, _, _ = hc2.read(pols=['Jee'])
         for k in g2:
             np.testing.assert_array_equal(g[k], g2[k])
+
+    def test_update(self):
+        hc = io.HERACal(self.fname)
+        g, f, q, tq = hc.read()
+        for ant in hc.ants:
+            g[ant] *= (2.0 + 1.0j)
+            f[ant] = np.logical_not(f[ant])
+            q[ant] += 1
+        for pol in hc.pols:
+            tq[pol] += 2
+        hc.update(gains=g, flags=f, quals=q, total_qual=tq)
+        g2, f2, q2, tq2 = hc.build_calcontainers()
+        for ant in hc.ants:
+            np.testing.assert_array_almost_equal(g[ant], g2[ant])
+            np.testing.assert_array_equal(f[ant], f2[ant])
+            np.testing.assert_array_equal(q[ant], q2[ant])
+        for pol in hc.pols:
+            np.testing.assert_array_equal(tq[pol], tq2[pol])
+
+        # test with slicing
+        hc = io.HERACal(self.fname)
+        g, f, q, tq = hc.read()
+        g0, f0, q0, tq0 = hc.read()
+        is_updated = np.zeros((hc.Ntimes, hc.Nfreqs), dtype=bool)
+        is_updated[slice(0, 11), slice(500, 600)] = True
+        for ant in hc.ants:
+            g[ant] = g[ant][slice(0, 1), slice(500, 600)]
+            f[ant] = f[ant][slice(0, 1), slice(500, 600)]
+            q[ant] = q[ant][slice(0, 1), slice(500, 600)]
+            g[ant] *= (2.0 + 1.0j)
+            f[ant] = np.logical_not(f[ant])
+            q[ant] += 1
+        for pol in hc.pols:
+            tq[pol] = tq[pol][slice(0, 1), slice(500, 600)]
+            tq[pol] += 2
+
+        hc.update(gains=g, flags=f, quals=q, total_qual=tq, tSlice=slice(0, 1), fSlice=slice(500, 600))
+        g2, f2, q2, tq2 = hc.build_calcontainers()
+        for ant in hc.ants:
+            np.testing.assert_array_almost_equal(g[ant].flatten(), g2[ant][is_updated])
+            np.testing.assert_array_equal(f[ant].flatten(), f2[ant][is_updated])
+            np.testing.assert_array_equal(q[ant].flatten(), q2[ant][is_updated])
+            np.testing.assert_array_almost_equal(g0[ant][~is_updated], g2[ant][~is_updated])
+            np.testing.assert_array_equal(f0[ant][~is_updated], f2[ant][~is_updated])
+            np.testing.assert_array_equal(q0[ant][~is_updated], q2[ant][~is_updated])
+        for pol in hc.pols:
+            np.testing.assert_array_equal(tq[pol].flatten(), tq2[pol][is_updated])
+            np.testing.assert_array_equal(tq0[pol][~is_updated], tq2[pol][~is_updated])
 
     def test_write(self):
         hc = HERACal(self.fname)
@@ -510,6 +562,29 @@ class Test_HERAData(object):
             np.testing.assert_array_equal(f[bl], f2[bl])
             np.testing.assert_array_equal(n[bl], n2[bl])
 
+        # test with slicing
+        hd = HERAData(self.uvh5_1)
+        d0, f0, n0 = hd.read()
+        d, f, n = hd.read()
+        is_updated = np.zeros((hd.Ntimes, hd.Nfreqs), dtype=bool)
+        is_updated[slice(3, 10), slice(500, 600)] = True
+        for bl in hd.bls:
+            d[bl] = d[bl][slice(3, 10), slice(500, 600)]
+            f[bl] = f[bl][slice(3, 10), slice(500, 600)]
+            n[bl] = n[bl][slice(3, 10), slice(500, 600)]
+            d[bl] *= (2.0 + 1.0j)
+            f[bl] = np.logical_not(f[bl])
+            n[bl] += 1
+        hd.update(data=d, flags=f, nsamples=n, tSlice=slice(3, 10), fSlice=slice(500, 600))
+        d2, f2, n2 = hd.build_datacontainers()
+        for bl in hd.bls:
+            np.testing.assert_array_almost_equal(d[bl].flatten(), d2[bl][is_updated])
+            np.testing.assert_array_equal(f[bl].flatten(), f2[bl][is_updated])
+            np.testing.assert_array_equal(n[bl].flatten(), n2[bl][is_updated])
+            np.testing.assert_array_almost_equal(d0[bl][~is_updated], d2[bl][~is_updated])
+            np.testing.assert_array_equal(f0[bl][~is_updated], f2[bl][~is_updated])
+            np.testing.assert_array_equal(n0[bl][~is_updated], n2[bl][~is_updated])
+
     def test_partial_write(self):
         hd = HERAData(self.uvh5_1)
         assert hd._writers == {}
@@ -662,6 +737,47 @@ class Test_HERAData(object):
         uvf2 = UVFlag(hd)
         assert uvf1 == uvf2
 
+    def init_HERACal(self):
+        hd = HERAData(self.uvh5_1)
+        hc = hd.init_HERACal(gain_convention='divide', cal_style='redundant')
+
+        # check some metadata
+        assert hd.Ntimes == hc.Ntimes
+        assert hc.Nants_data == hd.Nants_data
+        assert hc.telescope_name == hd.telescope_name
+
+        # check that arrays have been initialized
+        assert hc.gain_array is not None
+        np.testing.assert_array_equal(hc.gain_array, 1 + 0j)
+        assert hc.flag_array is not None
+        np.testing.assert_array_equal(hc.flag_array, True)
+        assert hc.quality_array is not None
+        np.testing.assert_array_equal(hc.quality_array, 0)
+        assert hc.total_quality_array is not None
+        np.testing.assert_array_equal(hc.total_quality_array, 0)
+
+    def test_to_dataarray(self):
+        hd = HERAData(self.uvh5_1)
+        d, f, n = hd.read()
+
+        original_data_array = hd.data_array.copy()
+
+        data_array_copy = hd.set_data_array_with_datacontainer(d, hd.data_array.copy())
+        data_array_inplace = hd.set_data_array_with_datacontainer(d, hd.data_array)
+
+        assert np.all(data_array_copy == data_array_inplace)
+
+        data_array_inplace += 1
+
+        assert np.all(data_array_copy != data_array_inplace)
+        # Ensure that the data_array inside the instance is changed since we did no copy.
+        assert np.all(hd.data_array == original_data_array + 1)
+
+        flag_array = hd.set_data_array_with_datacontainer(f, hd.flag_array.copy())
+        assert flag_array.dtype == bool
+
+        nsample_array = hd.set_data_array_with_datacontainer(n, hd.nsample_array.copy())
+        assert nsample_array.dtype == n.dtype
 
 class Test_ReadHeraHdf5(object):
     def setup_method(self):
@@ -755,7 +871,7 @@ class Test_ReadHeraHdf5(object):
             assert len(rv['info']['times']) == 2
 
 
-class Test_HERADataFastReader(object):
+class Test_HERADataFastReader:
     def setup_method(self):
         self.uvh5_1 = os.path.join(DATA_PATH, "test_input", "zen.2458042.60288.HH.uvRXLS.uvh5_downselected")
         self.uvh5_2 = os.path.join(DATA_PATH, "test_input", "zen.2458042.61034.HH.uvRXLS.uvh5_downselected")
@@ -783,59 +899,95 @@ class Test_HERADataFastReader(object):
             else:
                 np.testing.assert_array_equal(d[bl], np.abs(rv['data'][bl]))
 
-    def test_comp_to_HERAData(self):
-        for infile in ([self.uvh5_1], [self.uvh5_1, self.uvh5_2], self.uvh5_h4c):
-            hd = io.HERADataFastReader(infile, read_metadata=False)
-            d, f, n = hd.read(check=True)
-            hd2 = io.HERAData(infile)
-            d2, f2, n2 = hd2.read()
-            # compare all data and metadata
-            for dc1, dc2 in zip([d, f, n], [d2, f2, n2]):
-                for bl in dc1:
-                    if (split_bl(bl)[0] == split_bl(bl)[1]) and (infile != self.uvh5_h4c):
-                        # somehow there are numerical issues at play for H1C data
-                        np.testing.assert_allclose(dc1[bl], dc2[bl], rtol=1e-6)
-                    else:
-                        np.testing.assert_array_equal(dc1[bl], dc2[bl])
-                np.testing.assert_array_equal(dc1.freqs, dc2.freqs)
-                np.testing.assert_array_equal(dc1.times, dc2.times)
-                np.testing.assert_allclose(dc1.lsts, dc2.lsts)
-                np.testing.assert_array_equal(dc1.ants, dc2.ants)
-                np.testing.assert_array_equal(dc1.data_ants, dc2.data_ants)
-                np.testing.assert_array_equal(sorted(dc1.pols()), sorted(dc2.pols()))
-                np.testing.assert_array_equal(sorted(dc1.antpairs()), sorted(dc2.antpairs()))
-                np.testing.assert_array_equal(sorted(dc1.bls()), sorted(dc2.bls()))
-                for ant in dc1.antpos:
-                    np.testing.assert_array_almost_equal(dc1.antpos[ant] - dc2.antpos[ant], 0)
-                for ant in dc1.data_antpos:
-                    np.testing.assert_array_almost_equal(dc1.antpos[ant] - dc2.antpos[ant], 0)
-                for ap in dc1.times_by_bl:
-                    np.testing.assert_array_equal(dc1.times_by_bl[ap], dc2.times_by_bl[ap])
-                for ap in dc1.lsts_by_bl:
-                    np.testing.assert_allclose(dc1.lsts_by_bl[ap], dc2.lsts_by_bl[ap])
+    def compare_datacontainers(self, dc1, dc2, allow_close: bool = False):
+        for bl in dc1:
+            if (split_bl(bl)[0] == split_bl(bl)[1]) and allow_close:
+                # somehow there are numerical issues at play for H1C data
+                np.testing.assert_allclose(dc1[bl], dc2[bl], rtol=1e-6)
+            else:
+                np.testing.assert_array_equal(dc1[bl], dc2[bl])
+        np.testing.assert_array_equal(dc1.freqs, dc2.freqs)
+        np.testing.assert_array_equal(dc1.times, dc2.times)
+        np.testing.assert_allclose(dc1.lsts, dc2.lsts)
+        np.testing.assert_array_equal(dc1.ants, dc2.ants)
+        np.testing.assert_array_equal(dc1.data_ants, dc2.data_ants)
+        np.testing.assert_array_equal(sorted(dc1.pols()), sorted(dc2.pols()))
+        np.testing.assert_array_equal(sorted(dc1.antpairs()), sorted(dc2.antpairs()))
+        np.testing.assert_array_equal(sorted(dc1.bls()), sorted(dc2.bls()))
+        for ant in dc1.antpos:
+            np.testing.assert_array_almost_equal(dc1.antpos[ant] - dc2.antpos[ant], 0)
+        for ant in dc1.data_antpos:
+            np.testing.assert_array_almost_equal(dc1.antpos[ant] - dc2.antpos[ant], 0)
+        for ap in dc1.times_by_bl:
+            np.testing.assert_array_equal(dc1.times_by_bl[ap], dc2.times_by_bl[ap])
+        for ap in dc1.lsts_by_bl:
+            np.testing.assert_allclose(dc1.lsts_by_bl[ap], dc2.lsts_by_bl[ap])
+    
+    @pytest.mark.parametrize(
+        'infile', (['uvh5_1'], ['uvh5_1', 'uvh5_2'], 'uvh5_h4c')
+    )
+    @pytest.mark.parametrize(
+        'bls', (None, )
+    )
+    @pytest.mark.parametrize(
+        'pols', (None, ['ee'])
+    )
+    def test_comp_to_HERAData_dc(self, infile, bls, pols):
+        # This just turns the strings from the parametrize into actual objects
+        if isinstance(infile, list):
+            indata = [getattr(self, f) for f in infile]
+        else:
+            indata = getattr(self, infile)
+
+        hd = io.HERADataFastReader(indata, read_metadata=False)
+        hd2 = io.HERAData(indata)
+        if bls == "first10":
+            bls = hd2.get_antpairs()[:10]
+            print(bls)
+        elif bls == "conjugated":
+            bls = hd2.get_antpairs()[:15]
+            bls = [(b, a) for a, b in bls]
+
+        d, f, n = hd.read(check=True,bls=bls, pols=pols)
+        d2, f2, n2 = hd2.read(bls=bls, polarizations=pols)
+        print(d.antpairs())
+        print(d.times_by_bl.keys())
+        # compare all data and metadata
+        for dc1, dc2 in zip([d, f, n], [d2, f2, n2]):
+            self.compare_datacontainers(dc1, dc2, allow_close=infile != 'uvh5_h4c')              
+
+
+    @pytest.mark.parametrize(
+        'infile', (['uvh5_1'], 'uvh5_h4c')
+    )
+    def test_comp_to_HERAData_hd(self, infile):
+        # This just turns the strings from the parametrize into actual objects
+        if isinstance(infile, list):
+            infile = [getattr(self, f) for f in infile]
+        else:
+            infile = getattr(self, infile)
 
         # compare metadata stored in hd object
-        for infile in ([self.uvh5_1], self.uvh5_h4c):
-            hd1 = io.HERADataFastReader(infile)
-            d, f, n = hd.read(check=True)
-            hd2 = io.HERAData(infile)
-            d2, f2, n2 = hd2.read()
-            np.testing.assert_array_equal(hd1.freqs, hd2.freqs)
-            np.testing.assert_array_equal(hd1.times, hd2.times)
-            np.testing.assert_allclose(hd1.lsts, hd2.lsts)
-            np.testing.assert_array_equal(hd1.ants, hd2.ants)
-            np.testing.assert_array_equal(hd1.data_ants, hd2.data_ants)
-            np.testing.assert_array_equal(hd1.pols, hd2.pols)
-            np.testing.assert_array_equal(hd1.antpairs, hd2.antpairs)
-            np.testing.assert_array_equal(hd1.bls, hd2.bls)
-            for ant in hd1.antpos:
-                np.testing.assert_array_almost_equal(hd1.antpos[ant] - hd2.antpos[ant], 0)
-            for ant in hd1.data_antpos:
-                np.testing.assert_array_almost_equal(hd1.antpos[ant] - hd2.antpos[ant], 0)
-            for ap in hd1.times_by_bl:
-                np.testing.assert_array_equal(hd1.times_by_bl[ap], hd2.times_by_bl[ap])
-            for ap in hd1.lsts_by_bl:
-                np.testing.assert_allclose(hd1.lsts_by_bl[ap], hd2.lsts_by_bl[ap])
+        hd1 = io.HERADataFastReader(infile)
+        hd1.read(check=True)
+        hd2 = io.HERAData(infile)
+
+        np.testing.assert_array_equal(hd1.freqs, hd2.freqs)
+        np.testing.assert_array_equal(hd1.times, hd2.times)
+        np.testing.assert_allclose(hd1.lsts, hd2.lsts)
+        np.testing.assert_array_equal(hd1.ants, hd2.ants)
+        np.testing.assert_array_equal(hd1.data_ants, hd2.data_ants)
+        np.testing.assert_array_equal(hd1.pols, hd2.pols)
+        np.testing.assert_array_equal(hd1.antpairs, hd2.antpairs)
+        np.testing.assert_array_equal(hd1.bls, hd2.bls)
+        for ant in hd1.antpos:
+            np.testing.assert_array_almost_equal(hd1.antpos[ant] - hd2.antpos[ant], 0)
+        for ant in hd1.data_antpos:
+            np.testing.assert_array_almost_equal(hd1.antpos[ant] - hd2.antpos[ant], 0)
+        for ap in hd1.times_by_bl:
+            np.testing.assert_array_equal(hd1.times_by_bl[ap], hd2.times_by_bl[ap])
+        for ap in hd1.lsts_by_bl:
+            np.testing.assert_allclose(hd1.lsts_by_bl[ap], hd2.lsts_by_bl[ap])
 
     def test_errors(self):
         hd = io.HERADataFastReader([self.uvh5_1, self.uvh5_2])
@@ -951,6 +1103,7 @@ class Test_Visibility_IO_Legacy(object):
         self.data_file = os.path.join(DATA_PATH, "zen.2458043.12552.xx.HH.uvORA")
         self.uvd = UVData()
         self.uvd.read_miriad(self.data_file)
+        self.uvd.use_future_array_shapes()
         self.freq_array = np.unique(self.uvd.freq_array)
         self.antpos, self.ants = self.uvd.get_ENU_antpos(center=True, pick_data_ants=True)
         self.antpos = odict(list(zip(self.ants, self.antpos)))
@@ -971,6 +1124,7 @@ class Test_Visibility_IO_Legacy(object):
         # test uvd object
         uvd = UVData()
         uvd.read_miriad(fname)
+        uvd.use_future_array_shapes()
         data, flags = io.load_vis(uvd)
         assert data[(24, 25, 'ee')].shape == (60, 64)
         data, flags = io.load_vis([uvd])
@@ -1008,8 +1162,11 @@ class Test_Visibility_IO_Legacy(object):
         filename2 = os.path.join(DATA_PATH, 'zen.2458043.13298.xx.HH.uvORA')
         uvd1 = UVData()
         uvd1.read_miriad(filename1)
+        uvd1.use_future_array_shapes()
+
         uvd2 = UVData()
         uvd2.read_miriad(filename2)
+        uvd2.use_future_array_shapes()
         if uvd1.phase_type != 'drift':
             uvd1.unphase_to_drift()
         if uvd2.phase_type != 'drift':
@@ -1022,9 +1179,9 @@ class Test_Visibility_IO_Legacy(object):
                 uvmask = np.all(
                     np.array(list(zip(uvd.ant_1_array, uvd.ant_2_array))) == [i, j], axis=1)
                 np.testing.assert_equal(d[i, j][pol], np.resize(
-                    uvd.data_array[uvmask][:, 0, :, uvpol], d[i, j][pol].shape))
+                    uvd.data_array[uvmask][:, :, uvpol], d[i, j][pol].shape))
                 np.testing.assert_equal(f[i, j][pol], np.resize(
-                    uvd.flag_array[uvmask][:, 0, :, uvpol], f[i, j][pol].shape))
+                    uvd.flag_array[uvmask][:, :, uvpol], f[i, j][pol].shape))
 
         d, f = io.load_vis([filename1, filename2], nested_dict=True)
         for i, j in d:
@@ -1033,12 +1190,13 @@ class Test_Visibility_IO_Legacy(object):
                 uvmask = np.all(
                     np.array(list(zip(uvd.ant_1_array, uvd.ant_2_array))) == [i, j], axis=1)
                 np.testing.assert_equal(d[i, j][pol], np.resize(
-                    uvd.data_array[uvmask][:, 0, :, uvpol], d[i, j][pol].shape))
+                    uvd.data_array[uvmask][:, :, uvpol], d[i, j][pol].shape))
                 np.testing.assert_equal(f[i, j][pol], np.resize(
-                    uvd.flag_array[uvmask][:, 0, :, uvpol], f[i, j][pol].shape))
+                    uvd.flag_array[uvmask][:, :, uvpol], f[i, j][pol].shape))
 
         uvd = UVData()
         uvd.read_miriad(filename1)
+        uvd.use_future_array_shapes()
         assert len(io.load_vis([uvd], nested_dict=True)[0]) == uvd.Nbls
         # reorder baseline array
         uvd.baseline_array = uvd.baseline_array[np.argsort(uvd.baseline_array)]
@@ -1051,6 +1209,7 @@ class Test_Visibility_IO_Legacy(object):
         # get data
         uvd = UVData()
         uvd.read_uvh5(os.path.join(DATA_PATH, "zen.2458044.41632.xx.HH.XRAA.uvh5"))
+        uvd.use_future_array_shapes()
         data, flgs, ap, a, f, t, l, p = io.load_vis(uvd, return_meta=True)
         nsample = copy.deepcopy(data)
         for k in nsample.keys():
@@ -1058,11 +1217,12 @@ class Test_Visibility_IO_Legacy(object):
 
         # test basic execution
         uvd = io.write_vis("ex.uvh5", data, l, f, ap, start_jd=2458044, return_uvd=True, overwrite=True, verbose=True, x_orientation='east', filetype='uvh5')
+        uvd.use_future_array_shapes()
         hd = HERAData("ex.uvh5")
         hd.read()
         assert os.path.exists('ex.uvh5')
-        assert uvd.data_array.shape == (1680, 1, 64, 1)
-        assert hd.data_array.shape == (1680, 1, 64, 1)
+        assert uvd.data_array.shape == (1680, 64, 1)
+        assert hd.data_array.shape == (1680, 64, 1)
         assert np.allclose(data[(24, 25, 'ee')][30, 32], uvd.get_data(24, 25, 'ee')[30, 32])
         assert np.allclose(data[(24, 25, 'ee')][30, 32], hd.get_data(24, 25, 'ee')[30, 32])
         assert hd.x_orientation.lower() == 'east'
@@ -1072,8 +1232,9 @@ class Test_Visibility_IO_Legacy(object):
 
         # test with nsample and flags
         uvd = io.write_vis("ex.uv", data, l, f, ap, start_jd=2458044, flags=flgs, nsamples=nsample, x_orientation='east', return_uvd=True, overwrite=True, verbose=True)
-        assert uvd.nsample_array.shape == (1680, 1, 64, 1)
-        assert uvd.flag_array.shape == (1680, 1, 64, 1)
+        uvd.use_future_array_shapes()
+        assert uvd.nsample_array.shape == (1680, 64, 1)
+        assert uvd.flag_array.shape == (1680, 64, 1)
         assert np.allclose(nsample[(24, 25, 'ee')][30, 32], uvd.get_nsamples(24, 25, 'ee')[30, 32])
         assert np.allclose(flgs[(24, 25, 'ee')][30, 32], uvd.get_flags(24, 25, 'ee')[30, 32])
         assert uvd.x_orientation.lower() == 'east'
@@ -1090,6 +1251,7 @@ class Test_Visibility_IO_Legacy(object):
         outname = os.path.join(DATA_PATH, "test_output/zen.2458043.12552.xx.HH.modified.uvORA")
         uvd = UVData()
         uvd.read_miriad(fname)
+        uvd.use_future_array_shapes()
         data, flags, antpos, ants, freqs, times, lsts, pols = io.load_vis(fname, return_meta=True)
 
         # make some modifications
@@ -1150,6 +1312,7 @@ class Test_Calibration_IO_Legacy(object):
 
         cal = UVCal()
         cal.read_calfits(fname)
+        cal.use_future_array_shapes()
         gains, flags = io.load_cal(cal)
         assert len(gains.keys()) == 18
         assert len(flags.keys()) == 18
@@ -1170,6 +1333,8 @@ class Test_Calibration_IO_Legacy(object):
         cal_xx, cal_yy = UVCal(), UVCal()
         cal_xx.read_calfits(fname_xx)
         cal_yy.read_calfits(fname_yy)
+        cal_xx.use_future_array_shapes()
+        cal_yy.use_future_array_shapes()
         gains, flags, quals, total_qual, ants, freqs, times, pols = io.load_cal([cal_xx, cal_yy], return_meta=True)
         assert len(gains.keys()) == 36
         assert len(flags.keys()) == 36
@@ -1221,7 +1386,7 @@ class Test_Calibration_IO_Legacy(object):
         if os.path.exists('ex.calfits'):
             os.remove('ex.calfits')
         # test single integration write
-        gains2 = odict(list(map(lambda k: (k, gains[k][:1]), gains.keys())))
+        gains2 = odict([(k, gains[k][:1]) for k in gains.keys()])
         uvc = io.write_cal("ex.calfits", gains2, freqs, times[:1], return_uvc=True, outdir='./')
         assert np.allclose(uvc.integration_time, 0.0)
         assert uvc.Ntimes == 1
@@ -1255,6 +1420,7 @@ class Test_Calibration_IO_Legacy(object):
         outname = os.path.join(DATA_PATH, "test_output/zen.2457698.40355.xx.HH.uvc.modified.calfits.")
         cal = UVCal()
         cal.read_calfits(fname)
+        cal.use_future_array_shapes()
         gains, flags, quals, total_qual, ants, freqs, times, pols = io.load_cal(fname, return_meta=True)
 
         # make some modifications
@@ -1591,3 +1757,78 @@ def test_throw_away_flagged_ants(tmpdir):
             assert ant not in set(hdo.ant_1_array).union(set(hdo.ant_2_array))
         else:
             assert ant in set(hdo.ant_1_array).union(set(hdo.ant_2_array))
+
+class Test_UVDataFromFastUVH5:
+    """Test the uvdata_from_fastuvh5 function."""
+
+    def setup_class(self):
+        self.tmp = TemporaryDirectory()
+
+        self.uvd_default = create_mock_hera_obs()
+        self.uvd_blfirst = create_mock_hera_obs(time_axis_faster_than_bls=False)
+
+        self.uvd_default.initialize_uvh5_file(f"{self.tmp.name}/default.uvh5")
+        self.meta_default = FastUVH5Meta(f"{self.tmp.name}/default.uvh5")
+
+        self.uvd_blfirst.initialize_uvh5_file(f"{self.tmp.name}/blfirst.uvh5")
+        self.meta_blfirst = FastUVH5Meta(f"{self.tmp.name}/blfirst.uvh5")
+
+        random_order = np.random.permutation(np.arange(self.uvd_default.Nblts))
+        self.uvd_random = self.uvd_default.copy()
+        self.uvd_random.reorder_blts(order=random_order)
+        self.uvd_random.initialize_uvh5_file(f"{self.tmp.name}/random.uvh5")
+        self.meta_random = FastUVH5Meta(f"{self.tmp.name}/random.uvh5")
+
+    def teardown_class(self):
+        del self.tmp
+
+    def test_default(self):
+        uvd = io.uvdata_from_fastuvh5(self.meta_default)
+
+        assert uvd.metadata_only
+        np.testing.assert_equal(self.uvd_default.ant_1_array, uvd.ant_1_array)
+        np.testing.assert_equal(self.uvd_default.ant_2_array, uvd.ant_2_array)
+        np.testing.assert_equal(self.uvd_default.time_array, uvd.time_array)
+        np.testing.assert_equal(self.uvd_default.lst_array, uvd.lst_array)
+        
+    def test_blfirst(self):
+        uvd = io.uvdata_from_fastuvh5(self.meta_blfirst)
+
+        assert uvd.metadata_only
+        assert not uvd.time_axis_faster_than_bls
+        np.testing.assert_equal(self.uvd_blfirst.ant_1_array, uvd.ant_1_array)
+        np.testing.assert_equal(self.uvd_blfirst.ant_2_array, uvd.ant_2_array)
+        np.testing.assert_equal(self.uvd_blfirst.time_array, uvd.time_array)
+        np.testing.assert_equal(self.uvd_blfirst.lst_array, uvd.lst_array)
+        
+    def test_lsts_without_start_jd(self):
+        with pytest.raises(AttributeError, match='if times is not given, start_jd must be given'):
+            io.uvdata_from_fastuvh5(self.meta_default, times=None, start_jd=None, lsts=np.array([0.1, 0.2]))
+
+    def test_not_rect(self):
+        with pytest.raises(NotImplementedError, match='Cannot convert non-rectangular blts to UVData'):
+            io.uvdata_from_fastuvh5(self.meta_random)
+
+    def test_lsts_with_start_jd(self):
+        uvd = io.uvdata_from_fastuvh5(self.meta_default, lsts=np.array([0.1, 0.2]), start_jd=2459887)
+
+        assert uvd.Ntimes == 2
+        assert np.all(uvd.time_array >= 2459887)
+        np.testing.assert_allclose(np.unique(uvd.lst_array), np.array([0.1, 0.2]))
+
+    def test_times_without_lsts(self):
+        uvd = io.uvdata_from_fastuvh5(self.meta_default, times=np.array([2459887.0, 2459887.1]))
+
+        assert uvd.Ntimes == 2
+        np.testing.assert_allclose(np.unique(uvd.time_array), np.array([2459887.0, 2459887.1]))
+
+    def test_pass_time_and_lst(self):
+        with pytest.raises(AssertionError):
+            io.uvdata_from_fastuvh5(self.meta_default, times=np.array([2459887.0, 2459887.1]), lsts=np.array([0.1, 0.2, 0.3]))
+
+    def test_pass_metadata(self):
+        uvd = io.uvdata_from_fastuvh5(self.meta_default, history='I made this!')
+
+        assert uvd.history == 'I made this!'
+
+    

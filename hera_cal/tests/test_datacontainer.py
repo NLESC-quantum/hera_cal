@@ -36,6 +36,11 @@ class TestDataContainer(object):
         for pol in self.pols:
             for bl in self.antpairs:
                 self.bools[bl + (pol,)] = np.array([True])
+        self.blpolarr = {}
+        for bl in self.antpairs:
+            self.blpolarr[bl] = {}
+            for pol in self.pols:
+                self.blpolarr[bl][pol] = np.array([1j])
 
     def test_init(self):
         dc = datacontainer.DataContainer(self.blpol)
@@ -171,6 +176,15 @@ class TestDataContainer(object):
         assert 'xx' in dc.pols()
         assert 'yy' in dc.pols()
 
+        with pytest.raises(ValueError, match='Tuple keys to delete must be in the format'):
+            del dc['bad_key']
+
+        with pytest.raises(ValueError, match='Tuple keys to delete must be in the format'):
+            del dc[(1,2,3,4)]
+        
+        with pytest.raises(ValueError, match='Tuple keys to delete must be in the format'):
+            del dc[[1,2,'xx']]
+
     def test_getitem(self):
         dc = datacontainer.DataContainer(self.blpol)
         assert dc[(1, 2, 'xx')] == 1j
@@ -271,16 +285,9 @@ class TestDataContainer(object):
 
     def test_get(self):
         dc = datacontainer.DataContainer(self.blpol)
-        assert dc.get((1, 2), 'yy') == 1j
-        assert dc.get((2, 1), 'yy') == -1j
-        dc = datacontainer.DataContainer(self.polbl)
-        assert dc.get((1, 2), 'yy') == 1j
-        assert dc.get((2, 1), 'yy') == -1j
-        dc = datacontainer.DataContainer(self.both)
-        assert dc.get((1, 2), 'yy') == 1j
-        assert dc.get((2, 1), 'yy') == -1j
-        assert dc.get((1, 2), 'YY') == 1j
-        assert dc.get((2, 1), 'YY') == -1j
+        assert dc.get((1, 2, 'yy')) == 1j
+        assert dc.get((2, 1, 'yy'), 10) == -1j
+        assert dc.get((1, 200, 'yy'), 10) == 10
 
     def test_setter(self):
         dc = datacontainer.DataContainer(self.blpol)
@@ -302,9 +309,37 @@ class TestDataContainer(object):
         assert dc[(2, 1, 'xx')] == np.array([True])
         assert dc[(2, 1, 'xx')].dtype == bool
 
+    def test_dtype(self):
+        dc = datacontainer.DataContainer({})
+        assert dc.dtype is None
+        dc = datacontainer.DataContainer({(1, 2): {'xx': 2}})
+        assert dc.dtype is None
+        
+        dc = datacontainer.DataContainer(self.blpolarr)
+        assert dc.dtype == complex
+        dc = datacontainer.DataContainer(self.bools)
+        assert dc.dtype == bool
+
+    def test_setting_attrs(self):
+        """A dumb little test that makes sure if a weird dict-like object is passed in, it still works."""
+        class SmallDataContainer:
+            def __init__(self, d: dict):
+                self._data = deepcopy(d)
+                self.ants = set(sum(self._data.keys(), ()))
+            
+            def __getitem__(self, key):
+                return self._data[key]
+            
+            def keys(self):
+                return self._data.keys()
+            
+        blpol = SmallDataContainer(self.blpol)
+        
+        dc = datacontainer.DataContainer(blpol)
+        assert dc.ants == blpol.ants
 
 @pytest.mark.filterwarnings("ignore:The default for the `center` keyword has changed")
-class TestDataContainerWithRealData(object):
+class TestDataContainerWithRealData:
 
     def test_adder(self):
         test_file = os.path.join(DATA_PATH, "zen.2458043.12552.xx.HH.uvORA")
@@ -448,18 +483,23 @@ def test_RedDataContainer():
     reverse_data = datacontainer.DataContainer({red[0]: np.ones((10, 10)) * (red[0][0] + 1.0j * red[0][1]) for red in reverse_reds})
     rdata4 = datacontainer.RedDataContainer(deepcopy(reverse_data), reverse_reds)
     rdata5 = datacontainer.RedDataContainer(deepcopy(reverse_data), reds)
+    # build an incomplete datacontainer, then finish it
+    rdata6 = datacontainer.RedDataContainer(deepcopy(data), reds[:-1])
+    rdata6[reds[-1][0]] = deepcopy(data[reds[-1][0]])
+    #rdata6.build_red_keys(reds)
 
     # make sure that the data for a redundant group are being accessed from the same place in memory
-    for i, rdata in enumerate([rdata1, rdata2, rdata3, rdata4, rdata5]):
+    for i, rdata in enumerate([rdata1, rdata2, rdata3, rdata4, rdata5, rdata6]):
         for red in rdata.reds:
             for bl in red:
-                if i < 4:
+                if rdata != rdata5:
                     assert id(rdata[bl]) == id(rdata[red[0]])
                 else:
                     assert id(rdata[reverse_bl(bl)]) == id(rdata[reverse_bl(red[0])])
                 assert(rdata.get_ubl_key(bl) in red)
                 assert(rdata.has_key(rdata.get_ubl_key(bl)))
                 assert set(rdata.get_red(bl)) == set(red)
+                assert bl in rdata
             val_here = deepcopy(rdata[red[0]])
             rdata[red[0]] *= 2
             for bl in red:
@@ -479,3 +519,40 @@ def test_RedDataContainer():
     with pytest.raises(ValueError):
         data = datacontainer.DataContainer({bl: np.ones((10, 10)) * (bl[0] + 1.0j * bl[1]) for red in reds for bl in red})
         rdata = datacontainer.RedDataContainer(data, reds)
+
+
+def test_RedDataContainerKeyManipulation():
+    rdc = datacontainer.RedDataContainer({(0, 1, 'ee'): 10}, reds=[[(0, 1, 'ee'), (1, 2, 'ee')], [(2, 3, 'ee'), (3, 4, 'ee')]])
+
+    # test contains
+    assert (0, 1, 'ee') in rdc
+    assert (1, 2, 'ee') in rdc
+    assert (2, 1, 'ee') in rdc
+    assert (2, 3, 'ee') not in rdc
+
+    # basic operation test
+    rdc[1, 2, 'ee'] = 11j
+    assert rdc[0, 1, 'ee'] == 11j
+
+    # test that uninstantianted red has no data
+    with pytest.raises(KeyError):
+        rdc[2, 3, 'ee']
+
+    # test that uninstantiated red can still be used late
+    rdc[4, 3, 'ee'] = 12j
+    assert rdc[2, 3, 'ee'] == -12j
+
+    # test that rekeying eliminates keys
+    assert (2, 3, 'ee') in rdc._data or (3, 2, 'ee') in rdc._data
+    rdc.build_red_keys([[(0, 1, 'ee'), (1, 2, 'ee')]])
+    assert (2, 3, 'ee') not in rdc._data
+    assert (3, 2, 'ee') not in rdc._data
+    with pytest.raises(KeyError):
+        rdc[3, 4, 'ee']
+
+    # test collision after adding keys
+    rdc[0, 2, 'ee'] = 20j
+    rdc[1, 3, 'ee'] = 21j
+    with pytest.raises(ValueError):
+        rdc.build_red_keys([[(0, 2, 'ee'), (1, 3, 'ee')]])
+

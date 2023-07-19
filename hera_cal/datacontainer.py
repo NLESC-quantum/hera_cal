@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 # Copyright 2019 the HERA Project
 # Licensed under the MIT License
+from __future__ import annotations
 
 import numpy as np
 from collections import OrderedDict as odict
 import copy
 
+from typing import Sequence
 from .utils import conj_pol, comply_pol, make_bl, comply_bl, reverse_bl
-
+from .red_groups import RedundantGroups, Baseline, AntPair
 
 class DataContainer:
     """Dictionary-like object that abstracts away the pol/ant pair ordering of data
@@ -45,7 +47,7 @@ class DataContainer:
             self.__dict__.update(data.__dict__)
         else:
             self._data = odict()
-            if np.all([isinstance(k, (str, np.str)) for k in data.keys()]):  # Nested POL:{antpairs}
+            if np.all([isinstance(k, str) for k in data.keys()]):  # Nested POL:{antpairs}
                 for pol in data.keys():
                     for antpair in data[pol]:
                         self._data[make_bl(antpair, pol)] = data[pol][antpair]
@@ -57,8 +59,8 @@ class DataContainer:
                 self._data = odict([(comply_bl(k), data[k]) for k in sorted(data.keys())])
             else:
                 raise KeyError('Unrecognized key type or mix of key types in data dictionary.')
-            self._antpairs = set([k[:2] for k in self._data.keys()])
-            self._pols = set([k[-1] for k in self._data.keys()])
+            self._antpairs = set([k[:2] for k in self._data])
+            self._pols = set([k[-1] for k in self._data])
 
             # placeholders for metadata (or get them from data, if possible)
             for attr in ['ants', 'data_ants', 'antpos', 'data_antpos',
@@ -67,6 +69,19 @@ class DataContainer:
                     setattr(self, attr, getattr(data, attr))
                 else:
                     setattr(self, attr, None)
+        
+        
+    @property
+    def dtype(self):
+        """The dtype of the underlying data."""
+        if self.keys():
+            try:
+                return self._data[next(iter(self.keys()))].dtype
+            except AttributeError:
+                return None
+        else:
+            return None
+
 
     def antpairs(self, pol=None):
         '''Return a set of antenna pairs (with a specific pol or more generally).'''
@@ -125,8 +140,8 @@ class DataContainer:
                             return np.conj(self._data[reverse_bl(bl)])
                         else:
                             return self._data[reverse_bl(bl)]
-                    except(KeyError):
-                        raise KeyError('Cannot find either {} or {} in this DataContainer.'.format(key, reverse_bl(key)))
+                    except KeyError:
+                        raise KeyError(f'Cannot find either {key} or {reverse_bl(key)} in this DataContainer.')
 
     def __setitem__(self, key, value):
         '''Sets the data corresponding to the key. Only supports the form (0,1,'nn').
@@ -158,14 +173,20 @@ class DataContainer:
         if isinstance(key, tuple):
             key = [key]
         for k in key:
-            if isinstance(k, tuple) and (len(k) == 3):
-                k = comply_bl(k)
-                del self._data[k]
-            else:
-                raise ValueError(f'Tuple keys to delete must be in the format (ant1, ant2, pol), {k} is not.')
-        self._antpairs = set([k[:2] for k in self._data.keys()])
-        self._pols = set([k[-1] for k in self._data.keys()])
+            if not isinstance(k, tuple) or len(k) != 3:
+                raise ValueError(
+                    'Tuple keys to delete must be in the format (ant1, ant2, pol), '
+                    f'{k} is not.'
+                )
+            k = comply_bl(k)
+            del self._data[k]
+        self._antpairs = {k[:2] for k in self._data.keys()}
+        self._pols = {k[-1] for k in self._data.keys()}
 
+    @property
+    def shape(self) -> tuple[int]:
+        return self[next(iter(self.keys()))].shape
+        
     def concatenate(self, D, axis=0):
         '''Concatenates D, a DataContainer or a list of DCs, with self along an axis'''
         # check type of D
@@ -175,27 +196,21 @@ class DataContainer:
         if axis == 0:
             # check 1 axis is identical for all D
             for d in D:
-                if d[list(d.keys())[0]].shape[1] != self.__getitem__(list(self.keys())[0]).shape[1]:
+                if d.shape[1] != self.shape[1]:
                     raise ValueError("[1] axis of dictionary values aren't identical in length")
 
         if axis == 1:
             # check 0 axis is identical for all D
             for d in D:
-                if d[list(d.keys())[0]].shape[0] != self.__getitem__(list(self.keys())[0]).shape[0]:
+                if d.shape[0] != self.shape[0]:
                     raise ValueError("[0] axis of dictionary values aren't identical in length")
 
-        # start new object
-        newD = odict()
-
         # get shared keys
-        keys = set()
-        for d in D:
-            keys.update(d.keys())
+        keys = set(sum((list(d.keys()) for d in D), []))
+        keys = [k for k in keys if k in self]
 
         # iterate over D keys
-        for i, k in enumerate(keys):
-            if self.__contains__(k):
-                newD[k] = np.concatenate([self.__getitem__(k)] + list(map(lambda d: d[k], D)), axis=axis)
+        newD = {k: np.concatenate([self[k]] + [d[k] for d in D], axis=axis) for k in keys}
 
         return DataContainer(newD)
 
@@ -449,11 +464,11 @@ class DataContainer:
         '''Returns True if polarization (with some capitalization) is in the data.'''
         return comply_pol(pol) in self._pols
 
-    def get(self, antpair, pol):
-        '''Interface to DataContainer.__getitem__(bl + (pol,)).'''
-        return self[make_bl(antpair, pol)]
+    def get(self, key, val=None):
+        '''Allows for getting values with fallback if not found. Default None.'''
+        return (self[key] if key in self else val)
 
-    def select_or_expand_times(self, new_times, in_place=True):
+    def select_or_expand_times(self, new_times, in_place=True, skip_bda_check=False):
         '''Update self.times with new times, updating data and metadata to be consistent. Data and
         metadata will be deleted, rearranged, or duplicated as necessary using numpy's fancy indexing.
         Assumes that the 0th data axis is time. Does not support baseline-dependent averaging.
@@ -472,12 +487,13 @@ class DataContainer:
         assert dc.times is not None
         if not np.all([nt in dc.times for nt in new_times]):
             raise ValueError('All new_times must be in self.times.')
-        if dc.times_by_bl is not None:
-            for tbbl in dc.times_by_bl.values():
-                assert np.all(tbbl == dc.times), 'select_or_expand_times does not support baseline dependent averaging.'
-        if dc.lsts_by_bl is not None:
-            for lbbl in dc.lsts_by_bl.values():
-                assert np.all(lbbl == dc.lsts), 'select_or_expand_times does not support baseline dependent averaging.'
+        if not skip_bda_check:
+            if dc.times_by_bl is not None:
+                for tbbl in dc.times_by_bl.values():
+                    assert np.all(tbbl == np.asarray(dc.times)), 'select_or_expand_times does not support baseline dependent averaging.'
+            if dc.lsts_by_bl is not None:
+                for lbbl in dc.lsts_by_bl.values():
+                    assert np.all(lbbl == np.asarray(dc.lsts)), 'select_or_expand_times does not support baseline dependent averaging.'
 
         # update data
         nt_inds = np.searchsorted(np.array(dc.times), np.array(new_times))
@@ -504,19 +520,36 @@ class RedDataContainer(DataContainer):
     '''Structure for containing redundant visibilities that can be accessed by any
         one of the redundant baseline keys (or their conjugate).'''
 
-    def __init__(self, data, reds=None, antpos=None, bl_error_tol=1.0):
+    def __init__(
+            self, 
+            data: DataContainer | dict[Baseline, np.ndarray], 
+            reds: RedundantGroups | Sequence[Sequence[Baseline | AntPair]] | None=None, 
+            antpos: dict[int, np.ndarray] | None=None, 
+            bl_error_tol: float=1.0
+        ):
         '''Creates a RedDataContainer.
 
-        Arguments:
-            data: DataContainer or dictionary of visibilities, just as one would pass into DataContainer().
-                Will error if multiple baselines are part of the same redundant group.
-            reds: list of lists of redundant baseline tuples, e.g. (ind1, ind2, pol)
-            antpos: dictionary of antenna positions in the form {ant_index: np.array([x, y, z])}.
-                Will error if one tries to provide both reds and antpos. If neither is provided,
-                will try to to use data.antpos (which it might have if its is a DataContainer).
-            bl_error_tol: the largest allowable difference between baselines in a redundant group
-                (in the same units as antpos). Normally, this is up to 4x the largest antenna position
-                error. Will only be used if reds is inferred from antpos.
+        Parameters
+        ----------
+        data : DataContainer or dictionary of visibilities, just as one would pass into DataContainer().
+            Will error if multiple baselines are part of the same redundant group.
+        reds : :class:`RedundantGroups` object, or list of lists of redundant baseline tuples, e.g. (ind1, ind2, pol).
+            These are the redundant groups of baselines. If not provided, will try to 
+            infer them from antpos.
+        antpos: dictionary of antenna positions in the form {ant_index: np.array([x, y, z])}.
+            Will error if one tries to provide both reds and antpos. If neither is provided,
+            will try to to use data.antpos (which it might have if its is a DataContainer).
+        bl_error_tol : float
+            the largest allowable difference between baselines in a redundant group
+            (in the same units as antpos). Normally, this is up to 4x the largest antenna position
+            error. Will only be used if reds is inferred from antpos.
+
+        Attributes
+        ----------
+        reds 
+            A :class:`RedundantGroups` object that contains the redundant groups for 
+            the entire array, and methods to manipulate them. 
+            
         '''
         if reds is not None and antpos is not None:
             raise ValueError('Can only provide reds or antpos, not both.')
@@ -524,46 +557,94 @@ class RedDataContainer(DataContainer):
         super().__init__(data)
 
         # Figure out reds
-        if reds is not None:
-            self.reds = reds
-        else:
+        if reds is None:
             from .redcal import get_reds
             if antpos is not None:
-                self.reds = get_reds(antpos, pols=self.pols(), bl_error_tol=bl_error_tol)
+                reds = RedundantGroups.from_antpos(
+                    antpos=antpos, pols=self.pols(), bl_error_tol=bl_error_tol, include_autos=False
+                )
             elif hasattr(self, 'antpos') and self.antpos is not None:
-                self.reds = get_reds(self.antpos, pols=self.pols(), bl_error_tol=bl_error_tol)
+                reds = RedundantGroups.from_antpos(
+                    antpos=self.antpos, pols=self.pols(), bl_error_tol=bl_error_tol, include_autos=False
+                )
             else:
                 raise ValueError('Must provide reds, antpos, or have antpos available at data.antpos')
+        
+        if not isinstance(reds, RedundantGroups):
+            reds = RedundantGroups(red_list=reds, antpos=self.antpos)
 
-        # Map all redundant keys to the same underlying data
-        self._bl_to_red_key = {}
-        self._red_key_to_bls = {}
-        for red in self.reds:
-            bls_in_data = [bl for bl in red if self.has_key(bl)]
-            if len(bls_in_data) > 1:
-                raise ValueError(f'RedDataContainer can only be constructed with (at most) one baseline per group, \
-                                 but this data has the following redundant baselines: {bls_in_data}')
-            if len(bls_in_data) > 0:
-                self._red_key_to_bls[bls_in_data[0]] = []
-                self._red_key_to_bls[reverse_bl(bls_in_data[0])] = []
-                for bl in red:
-                    self._bl_to_red_key[bl] = bls_in_data[0]
-                    self._bl_to_red_key[reverse_bl(bl)] = reverse_bl(bls_in_data[0])
-                    self._red_key_to_bls[bls_in_data[0]].append(bl)
-                    self._red_key_to_bls[reverse_bl(bls_in_data[0])].append(reverse_bl(bl))
+        self.build_red_keys(reds)
 
-    def get_ubl_key(self, key):
-        '''Returns the key used interally denote the data stored. Useful for del'''
-        return self._bl_to_red_key[key]
 
+    def build_red_keys(self, reds: RedundantGroups | list[list[Baseline]]):
+        '''Build the dictionaries that map baselines to redundant keys.
+
+        Arguments:
+            reds: list of lists of redundant baseline tuples, e.g. (ind1, ind2, pol).
+        '''
+        
+        if isinstance(reds, RedundantGroups):
+            self.reds = reds
+        else:
+            self.reds = RedundantGroups(red_list=reds, antpos=getattr(self, 'antpos', None))
+                
+        self._reds_keyed_on_data = self.reds.keyed_on_bls(bls=self.bls())
+
+        # delete unused data to avoid leaking memory
+        del self[[k for k in self._data if k not in self.reds]]
+
+        # Check that the data only has one baseline per redundant group
+        redkeys = {}
+        for bl in self.bls():
+            ubl = self.reds.get_ubl_key(bl)
+            if ubl in redkeys:
+                raise ValueError(
+                    'RedDataContainer can only be constructed with (at most) one baseline per group, '
+                    f'but {bl} is redundant with {redkeys[ubl]}.'
+                ) 
+            else:
+                redkeys[ubl] = bl
+
+
+    def get_ubl_key(self, bl):
+        '''Returns the blkey used to internally denote the data stored.
+        
+        If this bl is in a redundant group present in the data, this will return the
+        blkey that exists in the data. Otherwise, it will return the array-wide blkey
+        representing this group.
+        '''
+        return self._reds_keyed_on_data.get_ubl_key(bl)
+        
     def get_red(self, key):
-        '''Returns the list of baselines redundant with this key.'''
-        return self._red_key_to_bls[self._bl_to_red_key[key]]
+        '''Returns the list of baselines in the array redundant with this key.
+        
+        Note: this is not just baselines existing in the data itself, but in the 
+              entire array.
+        '''
+        return self.reds[key]
 
     def __getitem__(self, key):
         '''Returns data corresponding to the unique baseline that key is a member of.'''
-        return super().__getitem__(self._bl_to_red_key[key])
+        return super().__getitem__(self.get_ubl_key(key))
 
     def __setitem__(self, key, value):
-        '''Sets data for to unique baseline that the key is a member of.'''
-        return super().__setitem__(self._bl_to_red_key[key], value)
+        '''Sets data for unique baseline that the key is a member of.'''
+        if key in self.reds:
+            ubl_key = self.get_ubl_key(key)
+        else:
+            # treat this as a new baseline not redundant with anything
+            self.reds.append([key])
+
+            # Since this is a completely new key, the BaselineKeyChooser will
+            # automatically use the only key in the group as the ubl key, we just
+            # need to add it to the potential key list.
+            self._reds_keyed_on_data.append([key])
+            ubl_key = key
+
+        super().__setitem__(ubl_key, value)
+
+
+    def __contains__(self, key):
+        '''Returns true if the baseline redundant with the key is in the data.'''
+        return (key in self.reds) and (super().__contains__(self.get_ubl_key(key)))
+        
