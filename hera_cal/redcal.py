@@ -1585,7 +1585,7 @@ def redundantly_calibrate(data, reds, sol0=None, run_logcal=True, run_omnical=Tr
         rc = RedundantCalibratorGPU(meta['filtered_reds'])
     elif quantum is not None:
         from .quantum_redcal import QuantumRedundantCalibrator
-        rc = QuantumRedundantCalibrator(quantum, meta['filtered_reds'])
+        rc = QuantumRedundantCalibrator(meta['filtered_reds'], quantum)
     else:
         rc = RedundantCalibrator(meta['filtered_reds'])
     if freqs is None:

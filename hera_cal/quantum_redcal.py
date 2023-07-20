@@ -3,52 +3,13 @@
 # Licensed under the MIT License
 
 import numpy as np
-from copy import deepcopy
-import argparse
-import os
-import linsolve
-from itertools import chain
+import linsolve.quantum
 
 from . import utils
-from .noise import predict_noise_variance_from_autos, infer_dt
-from .datacontainer import DataContainer, RedDataContainer
-from .utils import (
-    split_pol,
-    conj_pol,
-    split_bl,
-    reverse_bl,
-    join_bl,
-    join_pol,
-    comply_pol,
-    per_antenna_modified_z_scores,
-)
-from .io import HERAData, HERACal, write_cal, save_redcal_meta
-from .apply_cal import calibrate_in_place
-from .redcal import SEC_PER_DAY, IDEALIZED_BL_TOL
-from .redcal import (
-    get_pos_reds,
-    add_pol_reds,
-    get_reds,
-    filter_reds,
-    combine_reds,
-    parse_pol_mode,
-)
-from .redcal import (
-    reds_to_antpos,
-    make_sol_finite,
-    remove_degen_gains,
-    _check_polLists_minV,
-    _wrap_phs,
-    _flip_frac,
-    _find_flipped,
-    _firstcal_align_bls,
-    predict_chisq_per_bl,
-    predict_chisq_per_red,
-    predict_chisq_per_ant,
-    normalized_chisq,
-    _get_pol_load_list,
-)
-from .redcal import RedSol, OmnicalSolver, RedundantCalibrator
+from .datacontainer import DataContainer
+from .utils import split_bl
+
+from .redcal import *
 
 
 class QuantumOmnicalSolver(linsolve.quantum.QuantumLinProductSolver, OmnicalSolver):
@@ -76,7 +37,7 @@ class QuantumOmnicalSolver(linsolve.quantum.QuantumLinProductSolver, OmnicalSolv
                 are not to be solved for) which are passed to linsolve.LinProductSolver.
         """
 
-        linsolve.quantum.Quantum.LinProductSolver.__init__(
+        linsolve.quantum.QuantumLinProductSolver.__init__(
             self, solver, data, sol0, wgts=wgts, **kwargs
         )
 
