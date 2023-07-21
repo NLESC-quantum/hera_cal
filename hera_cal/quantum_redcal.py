@@ -10,6 +10,7 @@ from .datacontainer import DataContainer
 from .utils import split_bl
 
 from .redcal import *
+from .redcal import _firstcal_align_bls, _find_flipped, _wrap_phs
 
 
 class QuantumOmnicalSolver(linsolve.quantum.QuantumLinProductSolver, OmnicalSolver):
@@ -231,6 +232,8 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
                 w_ls[eq] = wc[key]
         return linsolve_method(self.solver, data=d_ls, wgts=w_ls, **kwargs)
 
+
+
     def firstcal(
         self,
         data,
@@ -239,6 +242,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         sparse=False,
         mode="vqls",
         flip_pnt=(np.pi / 2),
+        return_matrix = False
     ):
         """Solve for a calibration solution parameterized by a single delay and phase offset
         per antenna using the phase difference between nominally redundant measurements.
@@ -289,6 +293,10 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
             else:
                 d_ls[eq_key] = np.array((dly, _wrap_phs(off + np.pi)))
         ls = linsolve.quantum.QuantumLinearSolver(self.solver, d_ls, sparse=sparse)
+        
+        if return_matrix:
+            return ls.return_matrix()
+        
         sol = ls.solve(mode=mode)
         dlys = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
         offs = {self.unpack_sol_key(k): v[1] for k, v in sol.items()}
