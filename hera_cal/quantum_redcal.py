@@ -179,7 +179,7 @@ class QuantumOmnicalSolver(linsolve.quantum.QuantumLinProductSolver, OmnicalSolv
 
 
 class QuantumRedundantCalibrator(RedundantCalibrator):
-    def __init__(self, reds, solver=None, check_redundancy=False):
+    def __init__(self, reds, solver=None, check_redundancy=False, **kwargs):
         """Initialization of a class object for performing redundant calibration with logcal
         and lincal, both utilizing linsolve, and also degeneracy removal.
 
@@ -242,7 +242,8 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         sparse=False,
         mode="vqls",
         flip_pnt=(np.pi / 2),
-        return_matrix = False
+        return_matrix = False,
+        num_qubits = None
     ):
         """Solve for a calibration solution parameterized by a single delay and phase offset
         per antenna using the phase difference between nominally redundant measurements.
@@ -292,7 +293,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
                 d_ls[eq_key] = np.array((dly, off))
             else:
                 d_ls[eq_key] = np.array((dly, _wrap_phs(off + np.pi)))
-        ls = linsolve.quantum.QuantumLinearSolver(self.solver, d_ls, sparse=sparse)
+        ls = linsolve.quantum.QuantumLinearSolver(self.solver, d_ls, sparse=sparse, num_qubits=num_qubits)
         
         if return_matrix:
             return ls.return_matrix()
