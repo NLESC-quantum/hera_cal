@@ -333,7 +333,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         )  # compute vis sols for completeness (though not strictly necessary)
         return meta, sol
 
-    def logcal(self, data, sol0=None, wgts={}, sparse=False, mode="default"):
+    def logcal(self, data, sol0=None, wgts={}, sparse=False, mode="vqls"):
         """Takes the log to linearize redcal equations and minimizes chi^2.
 
         Args:
@@ -357,8 +357,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         if sol0 is not None:
             cal_data = {bl: sol0.calibrate_bl(bl, data[bl]) for bl in cal_data}
         ls = self._solver(
-            linsolve.quantum.QuantumLinearSolver,
-            self.solver,
+            linsolve.quantum.QuantumLogProductSolver,
             cal_data,
             wgts=wgts,
             detrend_phs=True,
@@ -413,7 +412,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         for ubl in self._ubl_to_reds_index.keys():
             sol0pack[self.pack_sol_key(ubl)] = sol0[ubl]
         ls = self._solver(
-            linsolve.quantum.QuantumLinearSovler,
+            linsolve.quantum.QuantumLinProductSolver,
             self.solver,
             data,
             sol0=sol0pack,
