@@ -9,6 +9,9 @@ import os
 import linsolve
 from itertools import chain
 
+import h5py
+import hdfdict 
+
 from . import utils
 from .noise import predict_noise_variance_from_autos, infer_dt
 from .datacontainer import DataContainer, RedDataContainer
@@ -755,6 +758,7 @@ class RedSol():
     '''
         chisq, chisq_per_ant = normalized_chisq(data, data_wgts, self.reds, self.vis, self.gains)
         return chisq, chisq_per_ant
+
 
 
 def _check_polLists_minV(polLists):

@@ -298,7 +298,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         if return_matrix:
             return ls.return_matrix()
         
-        sol = ls.solve(mode=mode)
+        sol, solver_data = ls.solve(mode=mode)
         dlys = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
         offs = {self.unpack_sol_key(k): v[1] for k, v in sol.items()}
         # add back in antennas in reds but not in the system of equations
@@ -331,7 +331,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         sol.update_vis_from_data(
             data
         )  # compute vis sols for completeness (though not strictly necessary)
-        return meta, sol
+        return meta, sol, solver_data
 
     def logcal(self, data, sol0=None, wgts={}, sparse=False, mode="vqls", return_matrix=False):
         """Takes the log to linearize redcal equations and minimizes chi^2.
