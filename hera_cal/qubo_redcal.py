@@ -13,7 +13,7 @@ from .redcal import *
 from .redcal import _firstcal_align_bls, _find_flipped, _wrap_phs
 
 
-class QuantumOmnicalSolver(linsolve.quantum.QuantumLinProductSolver, OmnicalSolver):
+class QUBOOmnicalSolver(linsolve.quantum.QUBOLinProductSolver, OmnicalSolver):
     def __init__(self, solver, data, sol0, wgts={}, gain=0.3, **kwargs):
         """Set up a nonlinear system of equations of the form g_i * g_j.conj() * V_mdl = V_ij
         to linearize via the Omnical algorithm described in HERA Memo 50
@@ -178,7 +178,7 @@ class QuantumOmnicalSolver(linsolve.quantum.QuantumLinProductSolver, OmnicalSolv
                 )
 
 
-class QuantumRedundantCalibrator(RedundantCalibrator):
+class QUBORedundantCalibrator(RedundantCalibrator):
     def __init__(self, reds, solver=None, check_redundancy=False, **kwargs):
         """Initialization of a class object for performing redundant calibration with logcal
         and lincal, both utilizing linsolve, and also degeneracy removal.
@@ -240,10 +240,9 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         freqs,
         maxiter=100,
         sparse=False,
-        mode="vqls",
+        mode="qubo",
         flip_pnt=(np.pi / 2),
         return_matrix = False,
-        num_qubits = None
     ):
         """Solve for a calibration solution parameterized by a single delay and phase offset
         per antenna using the phase difference between nominally redundant measurements.
@@ -293,12 +292,12 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
                 d_ls[eq_key] = np.array((dly, off))
             else:
                 d_ls[eq_key] = np.array((dly, _wrap_phs(off + np.pi)))
-        ls = linsolve.quantum.QuantumLinearSolver(self.solver, d_ls, sparse=sparse, num_qubits=num_qubits)
+        ls = linsolve.quantum.QUBOLinearSolver(self.solver, d_ls, sparse=sparse)
         
         if return_matrix:
             return ls.return_matrix()
         
-        sol, solver_data = ls.solve(mode=mode)
+        sol, res = ls.solve(mode=mode)
         dlys = {self.unpack_sol_key(k): v[0] for k, v in sol.items()}
         offs = {self.unpack_sol_key(k): v[1] for k, v in sol.items()}
         # add back in antennas in reds but not in the system of equations
@@ -331,9 +330,9 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         sol.update_vis_from_data(
             data
         )  # compute vis sols for completeness (though not strictly necessary)
-        return meta, sol, solver_data
+        return meta, sol, res
 
-    def logcal(self, data, sol0=None, wgts={}, sparse=False, mode="vqls", return_matrix=False, num_qubits=None):
+    def logcal(self, data, sol0=None, wgts={}, sparse=False, mode="qubo", return_matrix=False):
         """Takes the log to linearize redcal equations and minimizes chi^2.
 
         Args:
@@ -357,12 +356,11 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         if sol0 is not None:
             cal_data = {bl: sol0.calibrate_bl(bl, data[bl]) for bl in cal_data}
         ls = self._solver(
-            linsolve.quantum.QuantumLogProductSolver,
+            linsolve.quantum.QUBOLogProductSolver,
             cal_data,
             wgts=wgts,
             detrend_phs=True,
-            sparse=sparse,
-            num_qubits=num_qubits
+            sparse=sparse
         )
         if return_matrix:
             return ls.return_matrix()
@@ -385,7 +383,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         sol0,
         wgts={},
         sparse=False,
-        mode="default",
+        mode="qubo",
         conv_crit=1e-10,
         maxiter=50,
         verbose=False,
@@ -416,7 +414,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         for ubl in self._ubl_to_reds_index.keys():
             sol0pack[self.pack_sol_key(ubl)] = sol0[ubl]
         ls = self._solver(
-            linsolve.quantum.QuantumLinProductSolver,
+            linsolve.quantum.QUBOLinProductSolver,
             self.solver,
             data,
             sol0=sol0pack,
@@ -473,7 +471,7 @@ class QuantumRedundantCalibrator(RedundantCalibrator):
         for ubl in self._ubl_to_reds_index.keys():
             sol0pack[self.pack_sol_key(ubl)] = sol0[ubl]
         ls = self._solver(
-            QuantumOmnicalSolver, self.solver, data, sol0=sol0pack, wgts=wgts, gain=gain
+            QUBOOmnicalSolver, self.solver, data, sol0=sol0pack, wgts=wgts, gain=gain
         )
         meta, prms = ls.solve_iteratively(
             conv_crit=conv_crit,
