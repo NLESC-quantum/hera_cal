@@ -759,7 +759,19 @@ class RedSol():
         chisq, chisq_per_ant = normalized_chisq(data, data_wgts, self.reds, self.vis, self.gains)
         return chisq, chisq_per_ant
 
+    def gain_covariance_matrix(self, index_freq: int = 0):
+        """Returns the covariance matrix of the gains for the indexed frequency
 
+        Args:
+            index_freq (int, optional):index of the frequency. Defaults to 0.
+        """
+        gains = []
+        for ant in self.gains.keys():
+            gains.append(self.gains[ant][:, index_freq])
+        return np.cov(gains)
+    
+ 
+                                                     
 
 def _check_polLists_minV(polLists):
     """Given a list of unique visibility polarizations (e.g. for each red group), returns whether
