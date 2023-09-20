@@ -1,4 +1,5 @@
-# hera_cal
+# hera_cal_quantum
+
 [![](https://github.com/HERA-Team/hera_cal/workflows/Run%20Tests/badge.svg?branch=master)](https://github.com/HERA-Team/hera_cal/actions)
 [![codecov](https://codecov.io/gh/HERA-Team/hera_cal/branch/master/graph/badge.svg)](https://codecov.io/gh/HERA-Team/hera_cal)
 
