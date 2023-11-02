@@ -80,7 +80,7 @@ class TestQuantumRedundantCalibrator(object):
             )
         for ant in gains.keys():
             gains[ant] *= fc_gains[ant]
-        meta, sol_fc = rc.firstcal(d, freqs)
+        meta, sol_fc, solver_data = rc.firstcal(d, freqs)
         np.testing.assert_array_almost_equal(
             np.linalg.norm([sol_fc[ant] - gains[ant] for ant in sol_fc.gains]),
             0,
@@ -107,7 +107,7 @@ class TestQuantumRedundantCalibrator(object):
             )
         for ant in gains.keys():
             gains[ant] *= fc_gains[ant]
-        meta, sol_fc = rc.firstcal(d, freqs)
+        meta, sol_fc, solver_data_fc = rc.firstcal(d, freqs)
         np.testing.assert_array_almost_equal(
             np.linalg.norm([sol_fc[ant] - gains[ant] for ant in sol_fc.gains]),
             0,
