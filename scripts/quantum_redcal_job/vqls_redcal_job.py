@@ -18,8 +18,8 @@ from hera_cal.utils import split_bl
 import h5py 
 import hdfdict
 
-from vqls_prototype import VQLS, VQLSLog
-from vqls_prototype import Hybrid_QST_VQLS, QST_VQLS
+from qalcore.qsikit.vqls import VQLS
+from qalcore.qsikit.vqls import Hybrid_QST_VQLS, QST_VQLS
 from qiskit.primitives import Estimator, Sampler 
 from qiskit.quantum_info import Statevector
 from qiskit.circuit.library.n_local.real_amplitudes import RealAmplitudes
