@@ -519,6 +519,16 @@ class RedSol():
         '''Returns the total number of entries in self.gains or self.vis.'''
         return len(self.gains) + len(self.vis)
 
+    def __iadd__(self, other):
+        """add the data of a 
+
+        Args:
+            other (_type_): _description_
+        """
+        for key, data in other.items():
+            self[key] = np.stack([self[key], data], axis=0)
+        return self
+
     def keys(self):
         '''Iterate over gain keys, then iterate over visibility keys.'''
         return self.__iter__()
