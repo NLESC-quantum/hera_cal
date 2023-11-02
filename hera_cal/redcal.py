@@ -1897,7 +1897,7 @@ def redcal_iteration(hd, nInt_to_load=None, pol_mode='2pol', bl_error_tol=1.0, e
                                               run_logcal=True, run_omnical=True,
                                               oc_conv_crit=oc_conv_crit, oc_maxiter=oc_maxiter,
                                               check_every=check_every, check_after=check_after,
-                                              max_dims=max_dims, gain=gain, gpu=gpu, quantum=quantum)
+                                              max_dims=max_dims, gain=gain, use_gpu=gpu, quantum=quantum)
 
             # solve for visibilities excluded from reds but with baselines with both gains in sol. These are not flagged.
             all_reds_this_pol = filter_reds(all_reds, pols=pols)

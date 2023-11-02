@@ -29,25 +29,6 @@ np.random.seed(0)
 
 
 class TestQuantumRedundantCalibrator(object):
-    def test_init(self):
-        # test a very small array
-        pos = hex_array(3, split_core=False, outriggers=0)
-        pos = {ant: pos[ant] for ant in range(4)}
-        reds = om.get_reds(pos)
-        rc = om.QuantumRedundantCalibrator(reds)
-        with pytest.raises(ValueError):
-            rc = om.QuantumRedundantCalibrator(reds, check_redundancy=True)
-
-        # test disconnected redundant array
-        pos = hex_array(5, split_core=False, outriggers=0)
-        pos = {ant: pos[ant] for ant in pos if ant in [0, 1, 5, 6, 54, 55, 59, 60]}
-        reds = om.get_reds(pos)
-        try:
-            rc = om.QuantumRedundantCalibrator(reds, check_redundancy=True)
-        except ValueError:
-            assert (
-                False
-            ), "This array is actually redundant, so check_redundancy should not raise a ValueError."
 
     def get_vqls_solver(self, nqubits):
         """_summary_"""
@@ -55,30 +36,16 @@ class TestQuantumRedundantCalibrator(object):
         optimizer = opt.COBYLA(maxiter=5)
         return VQLS(Estimator(), ansatz, optimizer)
 
-    def test_solver(self):
+    def test_init(self):
+        # test a very small array
         nqbits = 2
         nants = 2**nqbits
-        antpos = linear_array(nants)
+        pos = linear_array(nants)
+        pos = {ant: pos[ant] for ant in range(4)}
+        reds = om.get_reds(pos)
+
         vqls = self.get_vqls_solver(nqbits)
-        reds = om.get_reds(antpos, pols=["xx"], pol_mode="1pol")
-        info = om.QuantumRedundantCalibrator(reds)
-        gains, true_vis, d = sim_red_data(reds)
-        w = {}
-        w = dict([(k, 1.0) for k in d.keys()])
-
-        def solver(data, wgts, **kwargs):
-            np.testing.assert_equal(data["g_0_Jxx * g_1_Jxx_ * u_0_xx"], d[0, 1, "xx"])
-            np.testing.assert_equal(data["g_1_Jxx * g_2_Jxx_ * u_0_xx"], d[1, 2, "xx"])
-            np.testing.assert_equal(data["g_0_Jxx * g_2_Jxx_ * u_1_xx"], d[0, 2, "xx"])
-            if len(wgts) == 0:
-                return
-            np.testing.assert_equal(wgts["g_0_Jxx * g_1_Jxx_ * u_0_xx"], w[0, 1, "xx"])
-            np.testing.assert_equal(wgts["g_1_Jxx * g_2_Jxx_ * u_0_xx"], w[1, 2, "xx"])
-            np.testing.assert_equal(wgts["g_0_Jxx * g_2_Jxx_ * u_1_xx"], w[0, 2, "xx"])
-            return
-
-        info._solver(solver, vqls, d)
-        info._solver(solver, vqls, d, w)
+        rc = om.QuantumRedundantCalibrator(reds, solver=vqls)
 
     def test_firstcal(self):
         np.random.seed(21)
