@@ -54,7 +54,7 @@ setup_args = {
         'astropy',
         'astropy-healpix',
         'pyuvdata>=2.3.3',
-        'linsolve',
+        'linsolve @ git+https://github.com/QuantumRadioAstronomy/linsolve',
         'hera_qm',
         'scikit-learn',
         'hera-filters',
@@ -65,6 +65,8 @@ setup_args = {
         "jaxlib",
         'attrs',
         'frozendict',
+        'hdfdict',
+        'qalcore @ git+https://github.com/QuantumApplicationLab/qalcore'
     ],
     'extras_require': {
         "all": [

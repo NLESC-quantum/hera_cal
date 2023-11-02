@@ -1,10 +1,10 @@
 # hera_cal_quantum
+[![](https://github.com/QuantumRadioAstronomy/hera_cal_quantum/workflows/Run%20Tests/badge.svg?branch=master)](https://github.com/QuantumRadioAstronomy/hera_cal_quantum/actions)
+[![codecov](https://codecov.io/gh/QuantumRadioAstronomy/hera_cal_quantum/branch/master/graph/badge.svg)](https://codecov.io/gh/QuantumRadioAstronomy/hera_cal_quantum)
 
-[![](https://github.com/HERA-Team/hera_cal/workflows/Run%20Tests/badge.svg?branch=master)](https://github.com/HERA-Team/hera_cal/actions)
-[![codecov](https://codecov.io/gh/HERA-Team/hera_cal/branch/master/graph/badge.svg)](https://codecov.io/gh/HERA-Team/hera_cal)
+The hera_cal_quantum package add quantum solvers to the original hera_cal package through a dedicated fork of the linsolve package
 
-
-The hera_cal package includes modules and scripts for the calibration and LST-binning of [Hydrogen Epoch of Reionization Array (HERA)](http://reionization.org/) data, along with various helpful methods for filtering and smoothing of data and calibration solutions. These are meant for use interatively, as part of offline analysis (e.g. [IDR 2.2](http://reionization.org/manual_uploads/HERA069_IDR2.2_Memo_v2.html)), or as part of HERA's realtime analysis pipeline using [`hera_opm`](https://github.com/HERA-Team/hera_opm/).
+The original hera_cal package includes modules and scripts for the calibration and LST-binning of [Hydrogen Epoch of Reionization Array (HERA)](http://reionization.org/) data, along with various helpful methods for filtering and smoothing of data and calibration solutions. These are meant for use interatively, as part of offline analysis (e.g. [IDR 2.2](http://reionization.org/manual_uploads/HERA069_IDR2.2_Memo_v2.html)), or as part of HERA's realtime analysis pipeline using [`hera_opm`](https://github.com/HERA-Team/hera_opm/).
 
 This package only officially supports python 3, though most functionality will still work in python 2.
 

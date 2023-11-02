@@ -9,6 +9,9 @@ import os
 import linsolve
 from itertools import chain
 
+import h5py
+import hdfdict 
+
 from . import utils
 from .noise import predict_noise_variance_from_autos, infer_dt
 from .datacontainer import DataContainer, RedDataContainer
@@ -516,6 +519,16 @@ class RedSol():
         '''Returns the total number of entries in self.gains or self.vis.'''
         return len(self.gains) + len(self.vis)
 
+    def __iadd__(self, other):
+        """add the data of a 
+
+        Args:
+            other (_type_): _description_
+        """
+        for key, data in other.items():
+            self[key] = np.stack([self[key], data], axis=0)
+        return self
+
     def keys(self):
         '''Iterate over gain keys, then iterate over visibility keys.'''
         return self.__iter__()
@@ -756,6 +769,19 @@ class RedSol():
         chisq, chisq_per_ant = normalized_chisq(data, data_wgts, self.reds, self.vis, self.gains)
         return chisq, chisq_per_ant
 
+    def gain_covariance_matrix(self, index_freq: int = 0):
+        """Returns the covariance matrix of the gains for the indexed frequency
+
+        Args:
+            index_freq (int, optional):index of the frequency. Defaults to 0.
+        """
+        gains = []
+        for ant in self.gains.keys():
+            gains.append(self.gains[ant][:, index_freq])
+        return np.cov(gains)
+    
+ 
+                                                     
 
 def _check_polLists_minV(polLists):
     """Given a list of unique visibility polarizations (e.g. for each red group), returns whether
@@ -1530,7 +1556,7 @@ def _get_pol_load_list(pols, pol_mode='1pol'):
 def redundantly_calibrate(data, reds, sol0=None, run_logcal=True, run_omnical=True,
                           remove_degen=True, compute_chisq=True, freqs=None, times_by_bl=None,
                           oc_conv_crit=1e-10, oc_maxiter=500, check_every=10, check_after=50,
-                          gain=.4, max_dims=2, use_gpu=False):
+                          gain=.4, max_dims=2, use_gpu=False, quantum=None):
     '''Performs all three steps of redundant calibration: firstcal, logcal, and omnical.
 
     Arguments:
@@ -1580,8 +1606,12 @@ def redundantly_calibrate(data, reds, sol0=None, run_logcal=True, run_omnical=Tr
     meta = {}  # dictionary of metadata
     meta['filtered_reds'] = filter_reds(reds, max_dims=max_dims)
     if use_gpu:
+        
         from hera_gpu.redcal import RedundantCalibratorGPU
         rc = RedundantCalibratorGPU(meta['filtered_reds'])
+    elif quantum is not None:
+        from .quantum_redcal import QuantumRedundantCalibrator
+        rc = QuantumRedundantCalibrator(meta['filtered_reds'], quantum)
     else:
         rc = RedundantCalibrator(meta['filtered_reds'])
     if freqs is None:
@@ -1621,7 +1651,6 @@ def redundantly_calibrate(data, reds, sol0=None, run_logcal=True, run_omnical=Tr
     if compute_chisq:
         meta['chisq'], meta['chisq_per_ant'] = sol.normalized_chisq(data, data_wgts)
     return meta, sol
-
 
 def expand_omni_vis(sol, expanded_reds, data, nsamples=None, chisq=None, chisq_per_ant=None):
     '''Updates sol by solving for unique visibilities not in sol.vis but for which there is at
@@ -1757,7 +1786,7 @@ def count_redundant_nsamples(nsamples, reds, good_ants=None):
 def redcal_iteration(hd, nInt_to_load=None, pol_mode='2pol', bl_error_tol=1.0, ex_ants=[],
                      solar_horizon=0.0, flag_nchan_low=0, flag_nchan_high=0,
                      oc_conv_crit=1e-10, oc_maxiter=500, check_every=10, check_after=50,
-                     gain=.4, max_dims=2, verbose=False, **filter_reds_kwargs):
+                     gain=.4, max_dims=2, verbose=False, gpu=False, quantum=None, **filter_reds_kwargs):
     '''Perform redundant calibration (firstcal, logcal, and omnical) an entire HERAData object, loading only
     nInt_to_load integrations at a time and skipping and flagging times when the sun is above solar_horizon.
 
@@ -1868,7 +1897,7 @@ def redcal_iteration(hd, nInt_to_load=None, pol_mode='2pol', bl_error_tol=1.0, e
                                               run_logcal=True, run_omnical=True,
                                               oc_conv_crit=oc_conv_crit, oc_maxiter=oc_maxiter,
                                               check_every=check_every, check_after=check_after,
-                                              max_dims=max_dims, gain=gain)
+                                              max_dims=max_dims, gain=gain, use_gpu=gpu, quantum=quantum)
 
             # solve for visibilities excluded from reds but with baselines with both gains in sol. These are not flagged.
             all_reds_this_pol = filter_reds(all_reds, pols=pols)
@@ -1911,7 +1940,7 @@ def redcal_run(input_data, firstcal_ext='.first.calfits', omnical_ext='.omni.cal
                ant_z_thresh=4.0, max_rerun=5, solar_horizon=0.0, flag_nchan_low=0, flag_nchan_high=0,
                oc_conv_crit=1e-10, oc_maxiter=500, check_every=10,
                check_after=50, gain=.4, max_dims=2, add_to_history='',
-               verbose=False, **filter_reds_kwargs):
+               verbose=False, gpu=False, quantum=None, **filter_reds_kwargs):
     '''Perform redundant calibration (firstcal, logcal, and omnical) an uvh5 data file, saving firstcal and omnical
     results to calfits and uvh5. Uses partial io if desired, performs solar flagging, and iteratively removes antennas
     with high chi^2, rerunning calibration as necessary.
@@ -2025,7 +2054,7 @@ def redcal_run(input_data, firstcal_ext='.first.calfits', omnical_ext='.omni.cal
                                                                      ex_ants=ex_ants, solar_horizon=solar_horizon, flag_nchan_low=flag_nchan_low,
                                                                      flag_nchan_high=flag_nchan_high, oc_conv_crit=oc_conv_crit, oc_maxiter=oc_maxiter,
                                                                      check_every=check_every, check_after=check_after, max_dims=max_dims, gain=gain,
-                                                                     verbose=verbose, **filter_reds_kwargs)
+                                                                     verbose=verbose, gpu=gpu, quantum=quantum, **filter_reds_kwargs)
 
         # Determine whether to add additional antennas to exclude
         _, _, chisq_per_ant, _ = hc_omni.build_calcontainers()
