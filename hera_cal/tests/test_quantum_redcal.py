@@ -16,9 +16,7 @@ from hera_sim.sigchain import gen_gains
 from qiskit.circuit.library import RealAmplitudes
 from qiskit.primitives import Sampler, Estimator
 from qiskit.algorithms import optimizers as opt
-from vqls_prototype.vqls import VQLS, VQLSLog
-from vqls_prototype.qst_vqls import QST_VQLS
-from vqls_prototype.hybrid_qst_vqls import Hybrid_QST_VQLS
+from qalcore.qiskit.vqls import VQLS
 
 from .. import quantum_redcal as om
 from .. import io, abscal
