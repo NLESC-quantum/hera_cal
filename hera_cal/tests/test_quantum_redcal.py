@@ -32,6 +32,7 @@ class TestQuantumRedundantCalibrator(object):
 
     def get_vqls_solver(self, nqubits):
         """_summary_"""
+        nqubits = int(nqubits)
         ansatz = RealAmplitudes(nqubits, entanglement="full", reps=3)
         optimizer = opt.COBYLA(maxiter=5)
         return VQLS(Estimator(), ansatz, optimizer)
